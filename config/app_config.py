@@ -5,8 +5,8 @@ APP_TITLE = "SmartPack – Container Load Planner"
 ORGANIZATION = "John Deere – Logistics Engineering"
 
 PROJECT_OWNER = {
-    "name": "Piyush Upadhye - (Data Wrangler)",
-    "email": "upadhyepiyushp@johndeere.com",
+    "name": "Jagadeswara Rao Nedunuri",
+    "email": "nedunurijagadeswararao@johndeere.com",
     "location": "ETEC, IN",
 }
 
