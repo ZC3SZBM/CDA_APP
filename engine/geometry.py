@@ -123,19 +123,34 @@ class MaxRectsBin:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def can_place(self, item_W: float, item_L: float) -> bool:
-        """True if (item_W × item_L) or its 90° rotation fits anywhere."""
+    def can_place(self, item_W: float, item_L: float,
+                  allow_rotate: bool = True) -> bool:
+        """
+        True if the item fits anywhere.
+
+        allow_rotate : when True (default) the 90° rotation is also tried;
+                       when False only the given (item_W × item_L) orientation
+                       is considered (used by the width-strip pass, which has
+                       already chosen its orientation).
+        """
         for fr in self.free:
-            if fr.fits(item_W, item_L) or fr.fits(item_L, item_W):
+            if fr.fits(item_W, item_L):
+                return True
+            if allow_rotate and fr.fits(item_L, item_W):
                 return True
         return False
 
-    def place(self, item_W: float, item_L: float) -> bool:
+    def place(self, item_W: float, item_L: float,
+              allow_rotate: bool = True) -> bool:
         """
-        Place one item of (item_W × item_L), 90° rotation allowed.
+        Place one item of (item_W × item_L).
 
         item_W goes along the container WIDTH  axis.
         item_L goes along the container LENGTH axis.
+
+        allow_rotate : when True (default) the 90° rotation is also tried and
+                       the tighter fit is chosen; when False the item is placed
+                       only in the given orientation.
 
         Returns True on success, False if no free rect can accommodate it.
         """
@@ -144,9 +159,11 @@ class MaxRectsBin:
         best_iW  = item_W   # chosen width  dimension of placed item
         best_iL  = item_L   # chosen length dimension of placed item
 
+        orientations = (((item_W, item_L), (item_L, item_W))
+                        if allow_rotate else ((item_W, item_L),))
+
         for fr in self.free:
-            # Try both orientations: normal and 90°-rotated
-            for iW, iL in ((item_W, item_L), (item_L, item_W)):
+            for iW, iL in orientations:
                 if not fr.fits(iW, iL):
                     continue
                 # Best Short Side Fits: minimise the smaller leftover dimension

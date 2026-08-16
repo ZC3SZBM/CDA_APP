@@ -126,17 +126,31 @@ def _pack_one(remaining: dict, dims: dict,
             continue   # rack doesn't fit in either orientation
 
         iW, iL, across, upr, _ = best
-        actual_used_W = across * iW   # total floor width actually occupied
 
         while qty > 0:
-            # Test against bin using correct axis order: (WIDTH, LENGTH)
-            if not bin_.can_place(actual_used_W, iL):
-                break
+            # How many units this row can take (full row = across*stack),
+            # capped by remaining qty and the weight limit.
             add = _max_add(used_wt, upr, qty, r_wt, MWT)
             if add <= 0:
                 break
-            if not bin_.place(actual_used_W, iL):
+
+            # Reserve ONLY the width the placed units actually occupy, not the
+            # full across-width. A row is `across` columns wide and `stack`
+            # high, so the number of columns used is ceil(add / stack). This
+            # leaves the unused width free, so other racks of the same
+            # footprint can sit SIDE BY SIDE in the same row (fixes distinct
+            # single-qty racks being spread one-per-row across containers).
+            cols_used = -(-add // stack)          # ceil division
+            strip_W   = cols_used * iW
+
+            # Placed in the orientation already chosen above — no rotation here,
+            # otherwise a narrow strip could be rotated and break the side-by-side
+            # tiling. (Passes 2 & 3 still allow rotation for leftovers.)
+            if not bin_.can_place(strip_W, iL, allow_rotate=False):
                 break
+            if not bin_.place(strip_W, iL, allow_rotate=False):
+                break
+
             load[r]   = load.get(r, 0) + add
             work[r]   = work.get(r, 0) - add
             used_wt  += add * r_wt
@@ -343,11 +357,28 @@ def pack_containers_exact(df, container):
     list of dict  { rack_name: quantity_in_this_container }
     """
 
+    # Group rows by rack NAME: sum duplicate rows, but keep DISTINCT racks
+    # separate even when their dimensions happen to be identical. (Grouping by
+    # dimensions and joining names with "|" produced names like "A|B" that the
+    # results view and report could not find in the original data -> crash.)
+    grouped = (
+        df.groupby("Rack / Finished Good", as_index=False)
+          .agg({
+              "Quantity":    "sum",
+              "Length (MM)": "first",
+              "Width (MM)":  "first",
+              "Height (MM)": "first",
+              "Weight (Kg)": "first",
+          })
+    )
+    grouped["Rack / Finished Good"] = grouped["Rack / Finished Good"].astype(str)
+
     initial = dict(zip(
-        df["Rack / Finished Good"],
-        df["Quantity"].astype(int),
+        grouped["Rack / Finished Good"],
+        grouped["Quantity"].astype(int),
     ))
-    dims = df.set_index("Rack / Finished Good").to_dict("index")
+
+    dims = grouped.set_index("Rack / Finished Good").to_dict("index")
 
     CL  = float(container["L"])
     CW  = float(container["W"])

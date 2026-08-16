@@ -102,7 +102,17 @@ def _build_layout_and_counts(load: dict, dims: dict, container: dict,
 
     records = []
     counts  = {}
-    current_y = 0.0
+
+    # Shared "shelf" cursor. Fill the container WIDTH of a row first (racks
+    # side by side across the width), THEN advance along the LENGTH. This
+    # mirrors how the packer fills a container, so the drawing matches reality:
+    # racks pack 2-, 3-across as they fit and the layout never runs past the
+    # container walls (previously every rack took its own length-row, so many
+    # single-qty racks lined up end-to-end and overflowed the box).
+    cur_y = 0.0   # length position where the current row starts
+    cur_x = 0.0   # width position of the next column in the current row
+    row_L = 0.0   # depth (length) of the current row
+    EPS   = 1e-6
 
     for r, total_qty in ordered:
         r_l = float(dims[r]["Length (MM)"])
@@ -126,35 +136,33 @@ def _build_layout_and_counts(load: dict, dims: dict, container: dict,
             continue
 
         item_W, item_L, fit_across, _ = best
-        remaining = total_qty
-        rows_used = 0
+        per_row = max(1, fit_across * stack)
 
+        remaining = total_qty
         while remaining > 0:
-            placed_this_row = 0
-            for col in range(fit_across):
+            # Start a new row if another column would exceed the container width.
+            if cur_x + item_W > CW + EPS:
+                cur_y += row_L
+                cur_x  = 0.0
+                row_L  = 0.0
+            # One column at (cur_x, cur_y): a vertical stack of up to `stack` units.
+            for layer in range(stack):
                 if remaining <= 0:
                     break
-                x_pos = col * item_W
-                for layer in range(stack):
-                    if remaining <= 0:
-                        break
-                    # ONE cuboid per individual unit
-                    records.append({
-                        "name": r, "color": color,
-                        "x": x_pos, "y": current_y, "z": layer * r_h,
-                        "iW": item_W, "iL": item_L, "h": r_h,
-                    })
-                    remaining -= 1
-                    placed_this_row += 1
-            if placed_this_row > 0:
-                rows_used += 1
-            current_y += item_L
+                records.append({
+                    "name": r, "color": color,
+                    "x": cur_x, "y": cur_y, "z": layer * r_h,
+                    "iW": item_W, "iL": item_L, "h": r_h,
+                })
+                remaining -= 1
+            row_L = max(row_L, item_L)
+            cur_x += item_W
 
         counts[r] = {
-            "length_wise": rows_used,
+            "length_wise": -(-total_qty // per_row),   # ceil(qty / per_row)
             "width_wise":  fit_across,
             "height_wise": stack,
-            "net_qty":     total_qty - remaining,
+            "net_qty":     total_qty,
         }
 
     return records, counts
@@ -195,7 +203,7 @@ _DOOR_AT_MAX_Y = True
 # Company logo shown bottom-centre of every PDF page / PPT slide, followed by
 # "Logistics Engineering" (title-green) and "Company Use" (red, bottom-right).
 # The file is looked up in a few likely locations; override by passing
-# logo_path=... to add_download_buttons / generate_pdf / generate_pptx.
+# logo_path=... to add_download_buttons / generate_pdf.
 _LOGO_FILENAME = "john_deere_footer.png"
 
 
@@ -574,11 +582,18 @@ def render_container_page(
     total_qty = sum(counts.get(r,{}).get("net_qty",0) for r in load)
     rows_data.append(["TOTAL", "", "", "", str(total_qty), "", f"{cont_wt:,.0f}"])
 
+    # Size the table to fit its panel no matter how many racks are in the
+    # container (a bbox in axes-fraction coords overrides per-row auto-height,
+    # so 14+ rows no longer overflow into the views below). Font shrinks a
+    # little as the row count grows.
+    n_total = len(rows_data) + 1                      # data rows + header
+    row_h   = 0.095
+    tbl_h   = min(1.0, n_total * row_h)
     tbl = ax_tbl.table(cellText=rows_data, colLabels=col_labels,
-                       cellLoc="center", loc="upper center")
+                       cellLoc="center", loc="upper center",
+                       bbox=[0.0, 1.0 - tbl_h, 1.0, tbl_h])
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8.5)
-    tbl.scale(1, 1.9)
+    tbl.set_fontsize(8.5 if n_total <= 11 else max(5.5, 8.5 * 11.0 / n_total))
     for j in range(len(col_labels)):
         tbl[0, j].set_facecolor("#D9D9D9")
         tbl[0, j].set_text_props(fontweight="bold", color="#1A1A1A")
@@ -699,62 +714,6 @@ def generate_pdf(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PPTX GENERATOR  — with John Deere footer
-# ══════════════════════════════════════════════════════════════════════════════
-
-def generate_pptx(
-    containers: list, dims: dict, container_spec: dict,
-    container_label: str = "40 HC",
-    output_path: str | None = None,
-    logo_path: str | None = None,
-) -> bytes:
-    """
-    Generate 16:9 PPTX, one slide per container.
-    The footer (company logo + "Logistics Engineering" centre, and
-    "Company Use" red right) is rendered into the slide image itself so it
-    is identical to the PDF.
-    """
-    try:
-        from pptx import Presentation
-        from pptx.util import Inches
-    except ImportError:
-        raise ImportError("pip install python-pptx")
-
-    all_racks = sorted({r for c in containers for r in c})
-    rack_color_map = {r: _rack_color(i) for i, r in enumerate(all_racks)}
-
-    prs = Presentation()
-    prs.slide_width  = Inches(13.33)
-    prs.slide_height = Inches(7.5)
-    blank_layout = prs.slide_layouts[6]
-
-    # Render at the slide's 16:9 aspect so the footer sits at the very bottom.
-    fig_w, fig_h = 15.2, 8.55   # 15.2 / 8.55 ~= 13.33 / 7.5
-
-    for ci, load in enumerate(containers, 1):
-        slide = prs.slides.add_slide(blank_layout)
-        png_buf = render_container_page(
-            load, dims, container_spec, rack_color_map,
-            container_number=ci, total_containers=len(containers),
-            container_label=container_label,
-            figsize=(fig_w, fig_h), dpi=150,
-            logo_path=logo_path,
-        )
-        slide.shapes.add_picture(
-            png_buf, Inches(0), Inches(0),
-            width=prs.slide_width, height=prs.slide_height,
-        )
-
-    buf = io.BytesIO()
-    prs.save(buf)
-    pptx_bytes = buf.getvalue()
-    if output_path:
-        with open(output_path, "wb") as f:
-            f.write(pptx_bytes)
-    return pptx_bytes
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  CONTAINER LABEL HELPER
 #  Maps your app's container-type dropdown value to the PDF/PPT title suffix.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -783,10 +742,10 @@ def container_label_from_type(container_type: str) -> str:
 
 def add_download_buttons(st, containers, dims, container_spec,
                          container_type: str = "40 HC",
-                         pdf_only: bool = False,
+                         pdf_only: bool = True,
                          logo_path: str | None = None):
     """
-    Add PDF (+ optionally PPTX) download buttons to a Streamlit app.
+    Add the PDF download button to a Streamlit app.
 
     `container_type` can be your raw dropdown value (e.g. "40HC", "20 GP");
     it is normalised automatically to e.g. "40 HC" for the title, which is
@@ -795,51 +754,28 @@ def add_download_buttons(st, containers, dims, container_spec,
     No shipment/route info (origin, destination) is shown anywhere in the
     report — only container + rack loading data.
 
+    Only the PDF is offered (the PPTX export was removed since the slides
+    aren't editable). `pdf_only` is kept for backward compatibility but is
+    now always effectively True.
+
     Parameters
     ----------
-    pdf_only  : if True, only the PDF download button is shown (no PPTX).
     logo_path : optional explicit path to the footer logo. If omitted, the
                 report looks for assets/john_deere_footer.png automatically.
 
     Usage:
         from engine.container_report import add_download_buttons
         add_download_buttons(st, containers, dims, container_spec,
-                             container_type=container_type, pdf_only=True)
+                             container_type=container_type)
     """
     label = container_label_from_type(container_type)
 
-    if pdf_only:
-        try:
-            pdf = generate_pdf(containers, dims, container_spec,
-                               container_label=label, logo_path=logo_path)
-            st.download_button(
-                "📄 Download PDF", pdf,
-                f"density_analysis_{label.replace(' ','_')}.pdf",
-                "application/pdf", use_container_width=True)
-        except Exception as e:
-            st.error(f"PDF error: {e}")
-        return
-
-    c1, c2 = st.columns(2)
-    with c1:
-        try:
-            pdf = generate_pdf(containers, dims, container_spec,
-                               container_label=label, logo_path=logo_path)
-            st.download_button(
-                "📄 Download PDF", pdf,
-                f"density_analysis_{label.replace(' ','_')}.pdf",
-                "application/pdf", use_container_width=True)
-        except Exception as e:
-            st.error(f"PDF error: {e}")
-    with c2:
-        try:
-            pptx = generate_pptx(containers, dims, container_spec,
-                                 container_label=label, logo_path=logo_path)
-            st.download_button(
-                "📊 Download PPTX", pptx,
-                f"density_analysis_{label.replace(' ','_')}.pptx",
-                "application/vnd.openxmlformats-officedocument"
-                ".presentationml.presentation",
-                use_container_width=True)
-        except Exception as e:
-            st.error(f"PPTX error: {e}")
+    try:
+        pdf = generate_pdf(containers, dims, container_spec,
+                           container_label=label, logo_path=logo_path)
+        st.download_button(
+            "📄 Download PDF", pdf,
+            f"density_analysis_{label.replace(' ','_')}.pdf",
+            "application/pdf", use_container_width=True)
+    except Exception as e:
+        st.error(f"PDF error: {e}")
