@@ -61,12 +61,66 @@ DISPLAY_COLUMNS = [
 
 _NUMERIC_TEXT_COLS = ["Length (MM)", "Width (MM)", "Height (MM)", "Weight (Kg)"]
 
+# ----------------------------------------------------
+# Per-rack packaging & stackability options
+# ----------------------------------------------------
+# Packaging materials the operator can pick (used by the stacking engine to
+# decide bearing capacity and the metal-on-corrugate rule).
+PACKAGING_MATERIALS = [
+    "Metal Rack",
+    "Plastic Box",
+    "Plastic Bin",
+    "Plastic Pallet",
+    "Wooden Pallet+Corrugate Box",
+    "Metal Pallet+Corrugate Box",
+    "Wooden Box",
+    "Plywood Box",
+]
+ALL_MATERIALS = PACKAGING_MATERIALS
+
+# Stackability choices:
+#   "Auto"          -> stack as many as SAFELY fit (uses height + the 540 kg /
+#                      metal-nesting capacity rules). This is the default so
+#                      racks that can stack are stacked (minimises floor space).
+#   "Non Stackable" -> never stack (box must stand alone).
+#   "G+1" .. "G+20" -> exactly Ground + N high (G+1 = 2 levels, G+2 = 3, ...).
+STACKABILITY_OPTIONS = ["Auto", "Non Stackable"] + [f"G+{i}" for i in range(1, 21)]
+
+# Sensible defaults for a fresh row.
+# Packaging Material is left BLANK on purpose: it is MANDATORY, so the user must
+# actively choose it (a wrong/blank material would give the wrong bearing
+# capacity). Stackability defaults to "Auto" so stackable racks are stacked.
+_PKG_DEFAULTS = {
+    "Packaging Material": "",
+    "Stackability": "Auto",
+}
+PACKAGING_COLUMNS = list(_PKG_DEFAULTS.keys())
+
+# Full set of columns the input table works with (dimensions + packaging)
+ALL_INPUT_COLUMNS = DISPLAY_COLUMNS + PACKAGING_COLUMNS
+
 
 def render_download_template():
-    df = pd.DataFrame(columns=DISPLAY_COLUMNS)
+    df = pd.DataFrame(columns=ALL_INPUT_COLUMNS)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
+        df.to_excel(writer, index=False, sheet_name="Rack Input")
+        ws = writer.sheets["Rack Input"]
+        # Note on the Height (MM) header: use the FOLDED height if folded.
+        try:
+            from openpyxl.comments import Comment
+            from openpyxl.utils import get_column_letter
+            h_col = get_column_letter(ALL_INPUT_COLUMNS.index("Height (MM)") + 1)
+            ws[f"{h_col}1"].comment = Comment(
+                "Enter the FOLDED height here if the rack / package is shipped "
+                "in folded condition.", "SmartPack")
+            # Visible note a couple of rows below the header row too.
+            note_row = 4
+            ws.cell(row=note_row, column=1,
+                    value=("NOTE: If a rack/package ships FOLDED, enter its "
+                           "FOLDED height in the Height (MM) column."))
+        except Exception:
+            pass
     st.download_button(
         "[↓] Download Input Template",
         buf.getvalue(),
@@ -280,8 +334,26 @@ def render_upload_section():
     uploaded = st.file_uploader("", type=["xlsx"])
     if uploaded:
         df = pd.read_excel(uploaded)
+        # Stackability is optional -> fill its default if the sheet lacks it.
+        if "Stackability" not in df.columns:
+            df["Stackability"] = _PKG_DEFAULTS["Stackability"]
+        # Packaging Material is MANDATORY -> do NOT invent a default. If the
+        # sheet has no material column, add it blank and warn the user.
+        if "Packaging Material" not in df.columns:
+            df["Packaging Material"] = ""
+            st.error("Your sheet has no **Packaging Material** column. It is "
+                     "required for correct stacking/weight results \u2014 please "
+                     "add it and re-upload.")
+        else:
+            _blank = df["Packaging Material"].astype(str).str.strip()
+            _named = df["Rack / Finished Good"].astype(str).str.strip() if \
+                "Rack / Finished Good" in df.columns else _blank
+            miss = df[(_named != "") & _blank.isin(["", "nan", "None"])]
+            if not miss.empty:
+                st.error("Some rows are missing **Packaging Material** (required). "
+                         "Please fill it in for every rack.")
         # allow formulas / decimals in the uploaded sheet too
-        return _clean_numeric_columns(df[DISPLAY_COLUMNS].copy())
+        return _clean_numeric_columns(df[ALL_INPUT_COLUMNS].copy())
 
     st.markdown("<div style='margin-top:-6px'></div>", unsafe_allow_html=True)
     st.info("No file uploaded. Enter rack details manually below \U0001F447")
@@ -290,11 +362,17 @@ def render_upload_section():
         "e.g. **45*25.4** (in\u2192mm), **3*304.8** (ft\u2192mm), "
         "**12*10** (cm\u2192mm), **120*0.453592** (lb\u2192kg)."
     )
+    st.caption(
+        "\U0001F4CF **Note:** If a rack / package is shipped in **folded condition**, "
+        "enter its **folded height** in the Height (MM) column.  "
+        "**Packaging Material is required** for every rack."
+    )
 
     # Source-of-truth dataframe fed to the editor. We keep it in session_state
-    # so we can write evaluated results back into the cells.
-    if "manual_base" not in st.session_state:
-        st.session_state.manual_base = pd.DataFrame(
+    # so we can write evaluated results back into the cells. Rebuild it if it's
+    # missing or predates the packaging columns.
+    def _fresh_base():
+        return pd.DataFrame(
             {
                 "Rack / Finished Good": [""],
                 "Quantity": [1],
@@ -302,8 +380,14 @@ def render_upload_section():
                 "Width (MM)": [""],
                 "Height (MM)": [""],
                 "Weight (Kg)": [""],
+                "Packaging Material": [_PKG_DEFAULTS["Packaging Material"]],
+                "Stackability": [_PKG_DEFAULTS["Stackability"]],
             }
         )
+
+    if ("manual_base" not in st.session_state
+            or not set(ALL_INPUT_COLUMNS).issubset(st.session_state.manual_base.columns)):
+        st.session_state.manual_base = _fresh_base()
     if "manual_ver" not in st.session_state:
         st.session_state.manual_ver = 0
 
@@ -324,6 +408,18 @@ def render_upload_section():
             "Weight (Kg)": st.column_config.TextColumn(
                 "Weight (Kg)", help="Type a number or a formula, e.g. 120*0.453592 for lb\u2192kg."
             ),
+            "Packaging Material": st.column_config.SelectboxColumn(
+                "Packaging Material", options=ALL_MATERIALS, required=True,
+                help=("REQUIRED. Metal Rack / Plastic Box / Plastic Bin / "
+                      "Plastic Pallet / Wooden Pallet+Corrugate Box / "
+                      "Metal Pallet+Corrugate Box / Wooden Box / Plywood Box."),
+            ),
+            "Stackability": st.column_config.SelectboxColumn(
+                "Stackability", options=STACKABILITY_OPTIONS,
+                help=("Auto = stack as many as safely fit (default).  "
+                      "Non Stackable = keep single.  "
+                      "G+N = exactly Ground + N high (G+1 = 2 levels, G+2 = 3, ...)."),
+            ),
         },
     )
 
@@ -342,83 +438,26 @@ def render_upload_section():
         st.session_state.manual_ver += 1
         _do_rerun()
 
-    return numeric_df[DISPLAY_COLUMNS]
+    # Packaging Material is MANDATORY: flag any rack row that left it blank.
+    missing_mat = []
+    for idx, row in numeric_df.iterrows():
+        name = str(row.get("Rack / Finished Good", "")).strip()
+        mat  = str(row.get("Packaging Material", "")).strip()
+        if name and (not mat or mat.lower() in ("nan", "none")):
+            missing_mat.append(f"row {idx + 1}" + (f" ({name})" if name else ""))
+    if missing_mat:
+        st.error(
+            "**Packaging Material is required** (it decides the stacking / weight "
+            "capacity). Please pick a material for:\n\n- " + "\n- ".join(missing_mat)
+        )
+
+    return numeric_df[ALL_INPUT_COLUMNS]
 
 
 # ----------------------------------------------------
 # Results + Export
 # ----------------------------------------------------
-def render_results(
-    containers,
-    data,
-    container_type,
-    origin_city,
-    destination_city,
-    container_cost_df,
-    dry_van_cost_df,
-):
-    st.subheader("\U0001F4E6 Container-wise Loading Plan")
-    container_cfg = CONTAINERS[container_type]
-    container_volume = (
-        container_cfg["L"]
-        * container_cfg["W"]
-        * container_cfg["H"]
-    )
-    export_rows = []
-    for i, cont in enumerate(containers, start=1):
-        st.write(f"### \U0001F69B Container {i}")
-        st.dataframe(
-            pd.DataFrame(cont.items(), columns=["Rack / Finished Good", "Quantity"]),
-            use_container_width=True,
-        )
-        total_weight = 0
-        total_volume = 0
-        for rack, qty in cont.items():
-            row = data[data["Rack / Finished Good"] == rack].iloc[0]
-            total_weight += qty * row["Weight (Kg)"]
-            total_volume += (
-                qty
-                * row["Length (MM)"]
-                * row["Width (MM)"]
-                * row["Height (MM)"]
-            )
-        weight_util = (total_weight / container_cfg["MAX_WT"]) * 100
-        volume_util = (total_volume / container_volume) * 100
-        st.markdown(
-            f"""
-            **Weight Used:** {total_weight:.0f} KG ({weight_util:.2f}%)
-            **Volume Utilization:** {volume_util:.2f}%
-            """
-        )
-        for rack, qty in cont.items():
-            export_rows.append([
-                i,
-                rack,
-                qty,
-                round(total_weight, 0),
-                round(weight_util, 2),
-                round(volume_util, 2),
-            ])
-
-    # ---------------- Transportation Cost ----------------
-    container_count = len(containers)
-    total_cost = calculate_total_cost(
-        container_count,
-        container_type,
-        origin_city,
-        destination_city,
-        container_cost_df,
-        dry_van_cost_df,
-    )
-    st.subheader("\U0001F4B0 Transportation Cost")
-    if total_cost is None:
-        st.warning("Cost data not available for selected route.")
-        cost_str = ""
-    else:
-        st.success(f"**Total Transportation Cost:** ${total_cost:,.2f}")
-        cost_str = f"${total_cost:,.2f}"
-
-    # ---------------- Download Loading Plan ----------------
+def _build_loading_plan_excel(export_rows):
     export_df = pd.DataFrame(
         export_rows,
         columns=[
@@ -428,17 +467,117 @@ def render_results(
             "Weight Used (Kg)",
             "Weight Utilization (%)",
             "Volume Utilization (%)",
+            "Total Transportation Cost",
         ],
     )
-    # Currency formatted with $
-    export_df["Total Transportation Cost"] = cost_str
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         export_df.to_excel(writer, index=False, sheet_name="Loading Plan")
     output.seek(0)
-    st.download_button(
-        "[\u2193] Download Loading Plan",
-        output,
-        "smartpack_container_loading_plan.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    return output.getvalue()
+
+
+def render_results(
+    containers,
+    data,
+    container_type,
+    origin_city,
+    destination_city,
+    container_cost_df,
+    dry_van_cost_df,
+):
+    container_cfg = CONTAINERS[container_type]
+    container_volume = container_cfg["L"] * container_cfg["W"] * container_cfg["H"]
+    n_containers = len(containers)
+
+    # ---------------- Cost (needed for the Excel too) ----------------
+    total_cost = calculate_total_cost(
+        n_containers, container_type, origin_city, destination_city,
+        container_cost_df, dry_van_cost_df,
     )
+    cost_str = f"${total_cost:,.2f}" if total_cost is not None else ""
+
+    # Pre-compute per-container utilisation + the export rows for the Excel.
+    per_container = []          # (weight, weight_util, volume_util)
+    export_rows = []
+    for i, cont in enumerate(containers, start=1):
+        total_weight = 0.0
+        total_volume = 0.0
+        for rack, qty in cont.items():
+            row = data[data["Rack / Finished Good"] == rack].iloc[0]
+            total_weight += qty * row["Weight (Kg)"]
+            total_volume += qty * row["Length (MM)"] * row["Width (MM)"] * row["Height (MM)"]
+        weight_util = (total_weight / container_cfg["MAX_WT"]) * 100
+        volume_util = (total_volume / container_volume) * 100
+        per_container.append((total_weight, weight_util, volume_util))
+        for rack, qty in cont.items():
+            export_rows.append([
+                i, rack, qty, round(total_weight, 0),
+                round(weight_util, 2), round(volume_util, 2), cost_str,
+            ])
+
+    excel_bytes = _build_loading_plan_excel(export_rows)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SUMMARY BOX (top): containers required + downloads.
+    # The Excel is built instantly; the PDF layout report is built ONLY when
+    # the user asks for it (it is slow for many containers, and for large jobs
+    # people usually just need the container count).
+    # ══════════════════════════════════════════════════════════════════════
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([1.4, 1.3, 1.3])
+        with c1:
+            st.metric("Containers required", n_containers)
+        with c2:
+            st.download_button(
+                "[\u2193] Download Load Plan (Excel)",
+                excel_bytes,
+                "container_loading_plan.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with c3:
+            gen = st.button("\U0001F4C4 Layout Report (PDF)", use_container_width=True)
+            if gen:
+                with st.spinner("Generating layout report (PDF)\u2026 this can take a "
+                                "while when there are many containers."):
+                    from engine.container_report import (
+                        generate_pdf, container_label_from_type,
+                    )
+                    dims = data.set_index("Rack / Finished Good").to_dict("index")
+                    label = container_label_from_type(container_type)
+                    try:
+                        st.session_state["layout_pdf_bytes"] = generate_pdf(
+                            containers, dims, container_cfg, container_label=label)
+                    except Exception as e:
+                        st.session_state["layout_pdf_bytes"] = None
+                        st.error(f"PDF error: {e}")
+            if st.session_state.get("layout_pdf_bytes"):
+                st.download_button(
+                    "[\u2193] Download PDF",
+                    st.session_state["layout_pdf_bytes"],
+                    "container_layout_report.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+        if total_cost is not None:
+            st.caption(f"Estimated transportation cost: **{cost_str}** "
+                       f"({origin_city} \u2192 {destination_city})")
+        else:
+            st.caption("Cost data not available for the selected route.")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # DETAILS: container-wise loading plan + utilisation.
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader("\U0001F4E6 Container-wise Loading Plan")
+    for i, cont in enumerate(containers, start=1):
+        total_weight, weight_util, volume_util = per_container[i - 1]
+        st.write(f"### \U0001F69B Container {i}")
+        st.dataframe(
+            pd.DataFrame(cont.items(), columns=["Rack / Finished Good", "Quantity"]),
+            use_container_width=True,
+        )
+        st.markdown(
+            f"**Weight Used:** {total_weight:.0f} KG ({weight_util:.2f}%)  \n"
+            f"**Volume Utilization:** {volume_util:.2f}%"
+        )
