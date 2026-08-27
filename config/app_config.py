@@ -1,6 +1,6 @@
 # config/app_config.py
 
-APP_TITLE = "SmartPack – Container Load Planner"
+APP_TITLE = "CDA – The Load Optimizer"
 
 ORGANIZATION = "John Deere – Logistics Engineering"
 
