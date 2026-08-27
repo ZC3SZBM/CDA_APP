@@ -13,9 +13,6 @@ from ui.sections import (
 from config.containers import CONTAINERS
 from engine.packing import pack_containers_exact
 
-# ✅ IMPORT DOWNLOAD FUNCTION
-from engine.container_report import add_download_buttons
-
 # ---------------------------------------------------------
 # Page config
 # ---------------------------------------------------------
@@ -87,11 +84,20 @@ with btn_right:
     reset_clicked = st.button("Reset")
 
 if reset_clicked:
+    # clear any stored result so the page goes back to a clean state
+    st.session_state.pop("smartpack_result", None)
     st.rerun()
 
 # ---------------------------------------------------------
-# RUN
+# RUN  (compute ONCE, then remember it)
 # ---------------------------------------------------------
+# Streamlit reruns the whole script on every click - including a download-
+# button click. So we must NOT keep the results/downloads inside the
+# `if calculate_clicked:` block, or they disappear after one download and the
+# user has to press Calculate again. Instead: when Calculate is pressed we do
+# all the heavy work once (pack + build the PDF) and store it in
+# st.session_state; the results + BOTH download buttons are then rendered from
+# that stored result on every rerun, so both downloads keep working.
 
 if calculate_clicked:
     data = df_input[
@@ -102,35 +108,55 @@ if calculate_clicked:
         st.error("No valid rack data.")
         st.stop()
 
-    # ✅ PACKING
-    containers = pack_containers_exact(
-        data,
-        CONTAINERS[container_type],
-    )
+    # Packaging Material is mandatory (it decides stacking / weight capacity).
+    if "Packaging Material" in data.columns:
+        _mat = data["Packaging Material"].astype(str).str.strip().str.lower()
+        if (_mat.isin(["", "nan", "none"])).any():
+            st.error("Every rack needs a **Packaging Material** before calculating. "
+                     "Please fill it in for all rows.")
+            st.stop()
 
-    # ✅ SHOW RESULTS
+    container_spec = CONTAINERS[container_type]
+
+    # One-time heavy work: PACK the containers only. The PDF layout report is
+    # NOT built here (it is slow for big jobs and often unwanted) — it is
+    # generated on demand from the "Layout Report (PDF)" button in the results.
+    with st.spinner("Calculating loading plan\u2026 please wait."):
+        containers = pack_containers_exact(data, container_spec)
+        dims = data.set_index("Rack / Finished Good").to_dict("index")
+
+    # A fresh calculation invalidates any previously generated PDF.
+    st.session_state.pop("layout_pdf_bytes", None)
+
+    # Remember everything so it survives the reruns caused by download clicks.
+    st.session_state["smartpack_result"] = {
+        "containers":       containers,
+        "data":             data,
+        "container_type":   container_type,
+        "origin_city":      origin_city,
+        "destination_city": destination_city,
+        "dims":             dims,
+    }
+    st.success(f"Loading plan ready \u2014 {len(containers)} container(s). "
+               "Download the Excel below, or generate the PDF layout report.")
+
+# ---------------------------------------------------------
+# SHOW RESULTS + DOWNLOADS  (runs on every rerun if a result exists)
+# ---------------------------------------------------------
+
+result = st.session_state.get("smartpack_result")
+if result is not None:
+    # Summary box (containers required + Excel + on-demand PDF) then the
+    # container-wise plan + utilisation. All downloads live in render_results.
     render_results(
-        containers,
-        data,
-        container_type,
-        origin_city,
-        destination_city,
+        result["containers"],
+        result["data"],
+        result["container_type"],
+        result["origin_city"],
+        result["destination_city"],
         container_cost_df,
         dry_van_cost_df,
     )
-
-    # ---------------------------------------------------------
-    # ✅ DOWNLOAD PDF + PPT BUTTONS (FINAL CORRECT PLACEMENT)
-    # ---------------------------------------------------------
-    dims = data.set_index("Rack / Finished Good").to_dict("index")
-    container_spec = CONTAINERS[container_type]
-
-    add_download_buttons(
-    st,
-    containers,
-    dims,
-    container_spec,
-    container_type=container_type)
 
 # ---------------------------------------------------------
 # FOOTER
