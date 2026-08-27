@@ -39,7 +39,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 from engine.geometry import MaxRectsBin
+from engine.stacking import build_stacks
 import itertools
+import time
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -250,10 +252,16 @@ def _pack_one(remaining: dict, dims: dict,
 
 def _greedy_run(initial: dict, dims: dict,
                 CL: float, CW: float, CH: float, MWT: float,
-                rack_order: list) -> list:
+                rack_order: list, deadline: float = None) -> list:
     remaining = dict(initial)
     containers = []
+    _n = 0
     while any(v > 0 for v in remaining.values()):
+        # Give up (return None) if we blow the time budget on a very large job,
+        # so the caller can fall back to the fast approximate result.
+        _n += 1
+        if deadline is not None and (_n & 15) == 0 and time.time() > deadline:
+            return None
         load, _ = _pack_one(remaining, dims, CL, CW, CH, MWT,
                             rack_order, mutate=True)
         if not load:
@@ -299,6 +307,87 @@ def _merge(containers: list, dims: dict,
 #  Strategy generator
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _single_footprint_pack(stack_initial: dict, stack_dims: dict,
+                           CL: float, CW: float, MWT: float):
+    """
+    Optimal container count when every stack shares ONE footprint.
+
+    Fills the container WIDTH with the best mix of two column orientations:
+      - "normal"  column: rack width (rw) across, holds floor(CL/rl) along length
+      - "rotated" column: rack length (rl) across, holds floor(CL/rw) along length
+    A small width-knapsack picks how many of each column maximises the stacks
+    per container (e.g. 1200x800 in a 2350-wide 40 HC -> one 800-wide lane of
+    10 + one 1200-wide lane of 15 = 25 per container, instead of 20).
+
+    Returns a list of containers ({sid: 1}), or None if the stacks are NOT all
+    one footprint (so the normal strategy search is used instead).
+    """
+    sids = list(stack_initial.keys())
+    if not sids:
+        return None
+
+    foot = None
+    for sid in sids:
+        rl = round(float(stack_dims[sid]["Length (MM)"]), 1)
+        rw = round(float(stack_dims[sid]["Width (MM)"]),  1)
+        if foot is None:
+            foot = (rl, rw)
+        elif (rl, rw) != foot:
+            return None                      # more than one footprint -> skip
+    rl, rw = foot
+    if rl <= 0 or rw <= 0:
+        return None
+
+    capA = int(CL // rl)                      # normal column: rw wide
+    capB = int(CL // rw)                      # rotated column: rl wide
+
+    # width-knapsack: maximise a*capA + b*capB with a*rw + b*rl <= CW
+    best_cap, _ba, _bb = 0, 0, 0
+    max_a = int(CW // rw) if rw > 0 else 0
+    for a in range(max_a + 1):
+        rem = CW - a * rw
+        b = int(rem // rl) if rl > 0 else 0
+        tot = a * capA + b * capB
+        if tot > best_cap:
+            best_cap, _ba, _bb = tot, a, b
+    if best_cap <= 0:
+        return None
+
+    if best_cap <= 0:
+        return None
+
+    # Distribute the (possibly many) identical stacks across containers:
+    # best_cap footprints per container, heaviest first, respecting the weight
+    # limit. Each sid carries a COUNT (grouped identical stacks).
+    remaining = {s: int(stack_initial[s]) for s in sids}
+    order = sorted(sids, key=lambda s: float(stack_dims[s]["Weight (Kg)"]),
+                   reverse=True)
+    total = sum(remaining.values())
+    containers, guard = [], 0
+    while total > 0:
+        guard += 1
+        if guard > total + len(sids) + 5:
+            return None
+        cont, slots, wt_left, placed_any = {}, best_cap, MWT, False
+        for s in order:
+            if slots <= 0:
+                break
+            w = float(stack_dims[s]["Weight (Kg)"])
+            cap_w = int(wt_left // w) if w > 0 else remaining[s]
+            take = min(slots, remaining[s], cap_w)
+            if take > 0:
+                cont[s] = cont.get(s, 0) + take
+                remaining[s] -= take
+                slots -= take
+                wt_left -= take * w
+                total -= take
+                placed_any = True
+        if not placed_any:
+            return None                      # even one stack won't fit by weight
+        containers.append(cont)
+    return containers
+
+
 def _strategies(racks: list, dims: dict) -> list:
     """
     All orderings to try.  ≤7 types → all permutations.  >7 → curated set.
@@ -325,13 +414,15 @@ def _strategies(racks: list, dims: dict) -> list:
             racks[::-1],
         ]
 
-    # Segregation: each rack type first, rest sorted by length desc
+    # Segregation: each rack type first, rest sorted by length desc.
+    # Skipped when there are many item types (would be too many full runs).
     segregations = []
-    for r in racks:
-        others = sorted([x for x in racks if x != r],
-                        key=lambda x: dims[x]["Length (MM)"], reverse=True)
-        segregations.append([r] + others)
-        segregations.append(others + [r])
+    if n <= 12:
+        for r in racks:
+            others = sorted([x for x in racks if x != r],
+                            key=lambda x: dims[x]["Length (MM)"], reverse=True)
+            segregations.append([r] + others)
+            segregations.append(others + [r])
 
     return base + segregations
 
@@ -340,44 +431,340 @@ def _strategies(racks: list, dims: dict) -> list:
 #  Public entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _lane_pack(stack_initial: dict, stack_dims: dict,
+               CL: float, CW: float, MWT: float):
+    """
+    Lane bin-packing for the common case where every stack shares one WIDTH
+    (e.g. all racks 1219.2 wide). The container is k = floor(CW/width) lanes;
+    each lane is filled along the LENGTH with a MIX of different-length racks
+    (First-Fit-Decreasing), so short and long racks share a lane with no gap.
+    Lanes are then packed k-per-container under the weight limit.
+
+    Returns a list of containers ({sid: 1}) or None if widths differ / infeasible.
+    """
+    sids = list(stack_initial.keys())
+    if not sids:
+        return None
+    widths = {round(float(stack_dims[s]["Width (MM)"]), 1) for s in sids}
+    if len(widths) != 1:
+        return None
+    w = widths.pop()
+    if w <= 0 or w > CW:
+        return None
+    k = int(CW // w)
+    if k < 1:
+        return None
+
+    EPS = 1e-6
+    total = sum(int(stack_initial[s]) for s in sids)
+    if total > 4000:            # too many to lane-pack cheaply; let greedy handle it
+        return None
+    items = []                  # expand grouped counts to individual stacks
+    for s in sids:
+        items.extend([s] * int(stack_initial[s]))
+    items.sort(key=lambda s: float(stack_dims[s]["Length (MM)"]), reverse=True)  # FFD
+    lanes = []                                                     # {used, wt, sids}
+    for s in items:
+        L  = float(stack_dims[s]["Length (MM)"])
+        sw = float(stack_dims[s]["Weight (Kg)"])
+        if L > CL + EPS or sw > MWT + EPS:
+            return None                                           # can't fit at all
+        placed = False
+        for lane in lanes:
+            if lane["used"] + L <= CL + EPS and lane["wt"] + sw <= MWT + EPS:
+                lane["used"] += L; lane["wt"] += sw; lane["sids"].append(s)
+                placed = True; break
+        if not placed:
+            lanes.append({"used": L, "wt": sw, "sids": [s]})
+
+    lanes.sort(key=lambda ln: ln["wt"], reverse=True)             # heavy lanes first
+    containers = []                                               # {lanes, wt, load}
+    for lane in lanes:
+        placed = False
+        for c in containers:
+            if c["lanes"] < k and c["wt"] + lane["wt"] <= MWT + EPS:
+                c["lanes"] += 1; c["wt"] += lane["wt"]
+                for s in lane["sids"]:
+                    c["load"][s] = c["load"].get(s, 0) + 1
+                placed = True; break
+        if not placed:
+            ld = {}
+            for s in lane["sids"]:
+                ld[s] = ld.get(s, 0) + 1
+            containers.append({"lanes": 1, "wt": lane["wt"], "load": ld})
+    return [c["load"] for c in containers]
+
+
+def _column_pack(stack_initial: dict, stack_dims: dict,
+                 CL: float, CW: float, MWT: float):
+    """
+    General greedy column packing: fill each container's width with columns
+    (each column = one footprint in one orientation, stacked along the length),
+    choosing at every step the column that loads the most stacks and mixing
+    footprints/orientations in the leftover width. Handles mixed footprints.
+
+    Returns a list of containers ({sid: 1}) or None if something cannot be placed.
+    """
+    from collections import defaultdict
+    EPS = 1e-6
+    groups = defaultdict(list)                 # (rl,rw) -> list of sids (expanded)
+    for sid in stack_initial:
+        rl = round(float(stack_dims[sid]["Length (MM)"]), 1)
+        rw = round(float(stack_dims[sid]["Width (MM)"]),  1)
+        groups[(rl, rw)].extend([sid] * int(stack_initial[sid]))
+    remaining = {f: list(s) for f, s in groups.items()}
+
+    def cols(f):
+        rl, rw = f
+        out = []
+        if 0 < rw <= CW:
+            out.append((rw, int(CL // rl) if rl > 0 else 0))       # normal column
+        if 0 < rl <= CW and abs(rl - rw) > EPS:
+            out.append((rl, int(CL // rw) if rw > 0 else 0))       # rotated column
+        return [(cw, cap) for cw, cap in out if cap > 0]
+
+    containers, guard = [], 0
+    while any(remaining[f] for f in remaining):
+        guard += 1
+        if guard > 1000000:
+            return None
+        load, width_left, weight_left = {}, CW, MWT
+        progress = True
+        while progress and width_left > EPS:
+            progress = False
+            best = None
+            for f in remaining:
+                avail = remaining[f]
+                if not avail:
+                    continue
+                for cw, cap in cols(f):
+                    if cw > width_left + EPS:
+                        continue
+                    # take up to `cap` stacks from the front, capped by weight
+                    ww, nn = 0.0, 0
+                    limit = min(cap, len(avail))
+                    for kk in range(limit):
+                        w = float(stack_dims[avail[kk]]["Weight (Kg)"])
+                        if ww + w > weight_left + EPS:
+                            break
+                        ww += w; nn += 1
+                    if nn <= 0:
+                        continue
+                    key = (nn, nn / cw)
+                    if best is None or key > best[0]:
+                        best = (key, f, cw, nn, ww)
+            if best is not None:
+                _, f, cw, nn, ww = best
+                take = remaining[f][:nn]
+                remaining[f] = remaining[f][nn:]
+                for sid in take:
+                    load[sid] = load.get(sid, 0) + 1
+                width_left -= cw
+                weight_left -= ww
+                progress = True
+        if not load:
+            return None                                            # stuck: infeasible
+        containers.append(load)
+    return containers
+
+
+def _lane_mixed_pack(stack_initial: dict, stack_dims: dict,
+                     CL: float, CW: float, MWT: float):
+    """
+    Mixed-footprint LANE packer. Fills the container width with lanes (full-
+    length strips); each lane is filled along the length with a MIX of any
+    footprints/orientations that fit its width (tightest-along orientation).
+    This finds "complementary" arrangements that grid/column packers miss —
+    e.g. a 1193.8-wide lane of one rack beside a 1092.2-wide lane of another,
+    the two summing to the container width.
+
+    Tries a few lane-orientation biases and sort orders and keeps the best.
+    Returns a list of containers ({sid: count}) or None. Skipped for very large
+    jobs (the greedy is O(n^2)); those use the time-budgeted search instead.
+    """
+    total = sum(int(v) for v in stack_initial.values())
+    if total == 0 or total > 1200:
+        return None
+    EPS = 1e-6
+    items = []
+    for sid, c in stack_initial.items():
+        d = stack_dims[sid]
+        items.append((sid, float(d["Length (MM)"]), float(d["Width (MM)"]),
+                      float(d["Weight (Kg)"]), int(c)))
+    # expand to individual stacks
+    flat = []
+    for sid, L, W, wt, c in items:
+        flat.extend([(sid, L, W, wt)] * c)
+
+    def run(order, bias):
+        remaining = [list(x) for x in order]
+        containers, guard = [], 0
+        while remaining:
+            guard += 1
+            if guard > len(flat) + 10:
+                return None
+            load, used_w, cwt, lanes = {}, 0.0, 0.0, []
+            progress = True
+            while progress:
+                progress = False
+                still = []
+                for it in remaining:
+                    sid, L, W, wt = it
+                    done = False
+                    if cwt + wt <= MWT + EPS:
+                        best_lane = None
+                        for lane in lanes:
+                            opts = [(cr, al) for cr, al in ((W, L), (L, W))
+                                    if cr <= lane["w"] + EPS and lane["f"] + al <= CL + EPS]
+                            if opts:
+                                cr, al = min(opts, key=lambda o: o[1])
+                                if best_lane is None or al < best_lane[2]:
+                                    best_lane = (lane, cr, al)
+                        if best_lane:
+                            lane, cr, al = best_lane
+                            lane["f"] += al
+                            load[sid] = load.get(sid, 0) + 1
+                            cwt += wt; progress = True; done = True
+                        else:
+                            cands = [(cr, al) for cr, al in ((W, L), (L, W))
+                                     if used_w + cr <= CW + EPS and al <= CL + EPS]
+                            if cands:
+                                cr, al = (max if bias == "wide" else min)(
+                                    cands, key=lambda o: o[0])
+                                lanes.append({"w": cr, "f": al})
+                                used_w += cr
+                                load[sid] = load.get(sid, 0) + 1
+                                cwt += wt; progress = True; done = True
+                    if not done:
+                        still.append(it)
+                remaining = still
+            if not load:
+                return None
+            containers.append(load)
+        return containers
+
+    best = None
+    sort_keys = (lambda f: max(f[1], f[2]),
+                 lambda f: f[1] * f[2],
+                 lambda f: min(f[1], f[2]))
+    for sk in sort_keys:
+        order = sorted(flat, key=sk, reverse=True)
+        for bias in ("wide", "narrow"):
+            r = run(order, bias)
+            if r and (best is None or len(r) < len(best)):
+                best = r
+    return best
+
+
+def _lane_mixed_pack(stack_initial: dict, stack_dims: dict,
+                     CL: float, CW: float, MWT: float):
+    """
+    Mixed-footprint LANE packing: fills each container with lanes running along
+    the length, letting different footprints/orientations share the width and
+    the length. Finds tight "complementary" fits (e.g. a 1193.8-wide lane beside
+    a 1092.2-wide lane filling a 2286-wide container) that the rectangle packer
+    misses. Tries a few sort orders and keeps the fewest-container result.
+    """
+    from engine.geometry import lane_layout
+    items = []
+    for sid, cnt in stack_initial.items():
+        L  = float(stack_dims[sid]["Length (MM)"])
+        W  = float(stack_dims[sid]["Width (MM)"])
+        wt = float(stack_dims[sid]["Weight (Kg)"])
+        for _ in range(int(cnt)):
+            items.append((L, W, wt, sid))
+    if not items or len(items) > 1200:      # O(n^2) — skip for huge jobs
+        return None
+
+    best = None
+    for mode in ("maxdim", "area", "mindim"):
+        for bias in ("wide", "narrow"):
+            remaining = list(items)
+            containers, guard, ok = [], 0, True
+            while remaining:
+                guard += 1
+                if guard > len(items) + 5:
+                    ok = False
+                    break
+                placements, leftover = lane_layout(remaining, CW, CL, MWT,
+                                                   mode, bias)
+                if not placements:
+                    ok = False
+                    break
+                load = {}
+                for (k, x, y, a, b) in placements:
+                    load[k] = load.get(k, 0) + 1
+                containers.append(load)
+                remaining = leftover
+            if ok and (best is None or len(containers) < len(best)):
+                best = containers
+    return best
+
+
+def _plan_fill_key(plan, stack_dims):
+    """
+    A comparable 'fill profile' for a plan: the floor area used in each
+    container, sorted fullest-first. Used to choose, among plans that use the
+    SAME (fewest) number of containers, the one that packs the earliest
+    containers as full as possible (so we don't ship a half-empty container 1
+    and a half-empty container 2 when one full + one part-full is possible).
+    """
+    fills = []
+    for cont in plan:
+        area = 0.0
+        for sid in cont:
+            d = stack_dims[sid]
+            area += float(d["Length (MM)"]) * float(d["Width (MM)"])
+        fills.append(area)
+    fills.sort(reverse=True)
+    return tuple(fills)
+
+
 def pack_containers_exact(df, container):
     """
     Pack all racks in `df` into the minimum number of containers.
+
+    Racks are first combined into vertical STACKS (see engine/stacking.py:
+    same footprint only, heavier at the bottom, capped by the Stackability
+    input or a 540 kg bearing capacity for non-metal / height for metal, and
+    never a metal base on a corrugate top). Each finished stack is then placed
+    on the container floor as one footprint, and the fewest-container search
+    runs over those stacks.
 
     Parameters
     ----------
     df        : pandas DataFrame with columns:
                   "Rack / Finished Good", "Quantity",
                   "Length (MM)", "Width (MM)", "Height (MM)", "Weight (Kg)"
+                Optional columns (used for stacking if present):
+                  "Packaging Material", "Stackability"
     container : dict  { "L": float, "W": float, "H": float, "MAX_WT": float }
-                Dimensions in mm, weight in kg.
 
     Returns
     -------
     list of dict  { rack_name: quantity_in_this_container }
     """
 
-    # Group rows by rack NAME: sum duplicate rows, but keep DISTINCT racks
-    # separate even when their dimensions happen to be identical. (Grouping by
-    # dimensions and joining names with "|" produced names like "A|B" that the
-    # results view and report could not find in the original data -> crash.)
-    grouped = (
-        df.groupby("Rack / Finished Good", as_index=False)
-          .agg({
-              "Quantity":    "sum",
-              "Length (MM)": "first",
-              "Width (MM)":  "first",
-              "Height (MM)": "first",
-              "Weight (Kg)": "first",
-          })
-    )
+    # Group rows by rack NAME: sum duplicate rows, keep distinct racks separate.
+    agg = {
+        "Quantity":    "sum",
+        "Length (MM)": "first",
+        "Width (MM)":  "first",
+        "Height (MM)": "first",
+        "Weight (Kg)": "first",
+    }
+    for opt in ("Packaging Material", "Material", "Packaging",
+                "Stackability", "Stack", "Max Stack"):
+        if opt in df.columns:
+            agg[opt] = "first"
+
+    grouped = df.groupby("Rack / Finished Good", as_index=False).agg(agg)
     grouped["Rack / Finished Good"] = grouped["Rack / Finished Good"].astype(str)
 
     initial = dict(zip(
         grouped["Rack / Finished Good"],
         grouped["Quantity"].astype(int),
     ))
-
     dims = grouped.set_index("Rack / Finished Good").to_dict("index")
 
     CL  = float(container["L"])
@@ -385,19 +772,111 @@ def pack_containers_exact(df, container):
     CH  = float(container["H"])
     MWT = float(container["MAX_WT"])
 
-    racks = [r for r in initial if initial[r] > 0]
+    # ── 1) Build vertical stacks (all the stacking rules live in stacking.py) ──
+    stacks = build_stacks(initial, dims, CH, MWT)
+    if not stacks:
+        return []
 
+    # ── 2) Represent finished stacks as floor items. IDENTICAL stacks (same
+    #       footprint AND same total weight) are grouped into ONE item with a
+    #       count, so the packer places thousands of identical stacks in bulk
+    #       instead of one at a time. Height is set to the container height so
+    #       the floor packer never re-stacks them (they are already stacked). ──
+    from collections import defaultdict as _dd
+    stack_groups = _dd(list)
+    for stk in stacks:
+        key = (round(stk[0]["L"], 2), round(stk[0]["W"], 2),
+               round(sum(b["wt"] for b in stk), 2))
+        stack_groups[key].append(stk)
+
+    stack_dims    = {}
+    stack_pool    = {}     # sid -> list of the actual stacks in this group
+    stack_initial = {}
+    for j, (key, stklist) in enumerate(stack_groups.items()):
+        sid = f"__g{j}"
+        L, W, wt = key
+        stack_dims[sid] = {"Length (MM)": L, "Width (MM)": W,
+                           "Height (MM)": CH, "Weight (Kg)": wt}
+        stack_pool[sid]    = stklist
+        stack_initial[sid] = len(stklist)
+
+    # ── 3) Try SEVERAL complete packing methods and keep the plan that uses
+    #       the fewest containers. Each method is a different way of filling
+    #       the container; taking the best means we never do worse than any
+    #       single method, and we catch wins that one method alone would miss:
+    #         (a) single-footprint mixed-orientation column optimum
+    #         (b) lane bin-packing (mixes lengths in each lane; uniform width)
+    #         (c) general greedy column packing (mixes footprints/orientations)
+    #         (d) the multi-strategy greedy search (Pass 1/2/3) + merge
+    # ──────────────────────────────────────────────────────────────────────────
+    sids = list(stack_initial.keys())
     best_result = None
-    best_count  = float("inf")
+    best_key    = None            # (num_containers, -fill_c1, -fill_c2, ...) minimise
 
-    for order in _strategies(racks, dims):
-        result = _greedy_run(initial, dims, CL, CW, CH, MWT, order)
-        result = _merge(result, dims, CL, CW, CH, MWT, order)
-        result = [c for c in result if c]
-        if len(result) < best_count:
-            best_count  = len(result)
-            best_result = result
-            if best_count == 1:
-                break
+    def _consider(plan):
+        nonlocal best_result, best_key
+        plan = [c for c in plan if c]
+        if not plan:
+            return
+        fk  = _plan_fill_key(plan, stack_dims)          # fullest first
+        key = (len(plan),) + tuple(-x for x in fk)      # fewer conts, then fuller c1...
+        if best_key is None or key < best_key:
+            best_key    = key
+            best_result = plan
 
-    return best_result or []
+    for method in (_single_footprint_pack, _lane_pack, _column_pack,
+                   _lane_mixed_pack):
+        try:
+            cand = method(stack_initial, stack_dims, CL, CW, MWT)
+        except Exception:
+            cand = None
+        if cand:
+            _consider(_merge([dict(c) for c in cand if c],
+                             stack_dims, CL, CW, CH, MWT, sids))
+
+    # Run the accurate exhaustive search, bounded by a TIME BUDGET so a huge
+    # job never runs longer than the operator will wait. The single best-sorted
+    # (longest-first) ordering is the near-optimum for large jobs — extra
+    # orderings don't improve it — so the budget just needs to be large enough
+    # for that ONE accurate pass to finish. If it can't finish in the budget the
+    # fast column/lane result (already found above) is used instead.
+    #   Raise PACK_TIME_BUDGET_S to allow bigger jobs the accurate (fewer-
+    #   container) count; lower it if you need a quicker, rougher answer.
+    PACK_TIME_BUDGET_S = 300.0
+    deadline = time.time() + PACK_TIME_BUDGET_S
+
+    orderings = _strategies(sids, stack_dims)
+    n_stacks = len(sids)
+    if n_stacks > 150:
+        orderings = orderings[:1]
+    elif n_stacks > 60:
+        orderings = orderings[:3]
+
+    for order in orderings:
+        if time.time() > deadline:
+            break
+        result = _greedy_run(stack_initial, stack_dims, CL, CW, CH, MWT,
+                             order, deadline=deadline)
+        if result is None:               # ran out of time -> keep fast result
+            break
+        result = _merge(result, stack_dims, CL, CW, CH, MWT, order)
+        _consider(result)
+        if best_key is not None and best_key[0] == 1:
+            break
+
+    # ── 4) Map the stacks in each container back to real rack quantities.
+    #       Pull `q` actual stacks from each group's pool (they are identical). ──
+    containers = []
+    for cont in (best_result or []):
+        names = {}
+        for sid, q in cont.items():
+            pool = stack_pool.get(sid, [])
+            for _ in range(int(q)):
+                if not pool:
+                    break
+                stk = pool.pop()
+                for b in stk:
+                    names[b["name"]] = names.get(b["name"], 0) + 1
+        containers.append(names)
+
+    return containers

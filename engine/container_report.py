@@ -37,6 +37,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import math
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from reportlab.lib.pagesizes import A4, landscape
@@ -51,6 +52,9 @@ _RACK_COLORS_HEX = [
     "#2980B9", "#27AE60", "#E67E22", "#8E44AD", "#C0392B",
     "#16A085", "#F1C40F", "#2C3E50", "#1ABC9C", "#D35400",
     "#7F8C8D", "#E74C3C", "#3498DB", "#9B59B6", "#2ECC71",
+    "#B9770E", "#117864", "#6C3483", "#A93226", "#1F618D",
+    "#0E6251", "#943126", "#7D6608", "#4A235A", "#0B5345",
+    "#154360", "#78281F", "#186A3B", "#B03A2E", "#5B2C6F",
 ]
 
 _JD_GREEN  = "#367C2B"   # John Deere green
@@ -71,101 +75,289 @@ def _darken(rgb, f):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  SKYLINE FLOOR PACKER (for the loading-plan drawing)
+#  Fills the container the way it is really loaded: each footprint rests at the
+#  lowest (nose-most) free spot across the width, so long racks anchor one lane
+#  while shorter racks fill the other lane independently. This avoids the old
+#  "row = longest rack" waste that left gaps and pushed a box past the doors.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SKEPS = 1e-6
+
+def _sky_base(sky, x, w):
+    """Highest filled length under the width span [x, x+w] (where a box rests)."""
+    a, b = x, x + w
+    m = 0.0
+    for x0, x1, y in sky:
+        if x1 <= a + _SKEPS or x0 >= b - _SKEPS:
+            continue
+        if y > m:
+            m = y
+    return m
+
+def _sky_raise(sky, a, b, newy):
+    """Set the width span [a, b] to filled-length newy; keep the rest; merge."""
+    out = []
+    for x0, x1, y in sky:
+        if x0 < a:
+            out.append([x0, min(x1, a), y])
+        if x1 > b:
+            out.append([max(x0, b), x1, y])
+        lo, hi = max(x0, a), min(x1, b)
+        if hi > lo:
+            out.append([lo, hi, newy])
+    out = [s for s in out if s[1] - s[0] > _SKEPS]
+    out.sort()
+    merged = [out[0]]
+    for s in out[1:]:
+        if abs(s[2] - merged[-1][2]) < 1e-6 and abs(s[0] - merged[-1][1]) < _SKEPS:
+            merged[-1][1] = s[1]
+        else:
+            merged.append(s)
+    sky[:] = merged
+
+def _sky_place(sky, w, l, CW, CL):
+    """
+    Place a footprint of width w, length l. Returns (x, y) of its nose corner.
+    Chooses the position that rests lowest (nearest the nose), tie-broken left.
+    """
+    xs = sorted({seg[0] for seg in sky} | {CW - w})
+    best = None
+    for x in xs:
+        if x < -_SKEPS or x + w > CW + _SKEPS:
+            continue
+        base = _sky_base(sky, x, w)
+        if base + l > CL + _SKEPS:
+            continue
+        key = (round(base, 3), round(x, 3))
+        if best is None or key < best[0]:
+            best = (key, x, base)
+    if best is None:                       # nothing fits within length: least-bad spot
+        cand = [x for x in xs if -_SKEPS <= x and x + w <= CW + _SKEPS]
+        if not cand:
+            cand = [0.0]
+        x = min(cand, key=lambda xx: _sky_base(sky, xx, w))
+        base = _sky_base(sky, x, w)
+    else:
+        _, x, base = best
+    _sky_raise(sky, x, x + w, base + l)
+    return x, base
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  LAYOUT BUILDER
 #  Reproduces strip-pass placement geometry AND computes the
 #  Length-wise / Width-wise / Height-wise counts for the summary table.
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _skyline_layout(stacks, CW, CL):
+    """Lane/skyline placement (natural orientation) -> [(stk, x, y, iW, iL)]."""
+    sky = [[0.0, CW, 0.0]]
+    out = []
+    for s in stacks:
+        s_l, s_w = s[0]["L"], s[0]["W"]
+        if s_w <= CW + _SKEPS:
+            iW, iL = s_w, s_l
+        elif s_l <= CW + _SKEPS:
+            iW, iL = s_l, s_w
+        else:
+            iW, iL = s_w, s_l
+        x, y = _sky_place(sky, iW, iL, CW, CL)
+        out.append((s, x, y, iW, iL))
+    return out
+
+
+def _maxrects_layout(stacks, CW, CL):
+    """
+    Placement using the SAME MaxRects packer the container packer uses, so the
+    drawing reproduces a real, tight, feasible layout. Returns
+    [(stk, x, y, iW, iL)] or None if any footprint could not be placed.
+    """
+    from engine.geometry import MaxRectsBin
+    order = sorted(stacks, key=lambda s: s[0]["L"] * s[0]["W"], reverse=True)
+    bin_ = MaxRectsBin(CW, CL)
+    out = []
+    for s in order:
+        L, W = s[0]["L"], s[0]["W"]
+        r = bin_.place_located(W, L, allow_rotate=True)   # W=width, L=length
+        if r is None:
+            return None
+        x, y, iW, iL = r
+        out.append((s, x, y, iW, iL))
+    return out
+
+
+def _max_extent(placed):
+    return max((y + iL) for _, x, y, iW, iL in placed) if placed else float("inf")
+
 
 def _build_layout_and_counts(load: dict, dims: dict, container: dict,
                              rack_color_map: dict):
     """
     Returns
     -------
-    records : list of PER-UNIT cuboid records — one record for every
-               individual rack unit (not merged into stack blocks). This is
-               what a forklift operator needs: each rack they physically
-               place corresponds to exactly one drawn cuboid with its own
-               visible edges, at its own (x, y, z) position.
+    records : list of PER-UNIT cuboid records — one per individual box, at its
+               own (x, y, z). Boxes that stack share a floor position and sit on
+               top of one another (heavier at the bottom), following the same
+               rules the packer uses (see engine/stacking.py).
                Each record: {name, color, x, y, z, iW, iL, h}
     counts  : { rack_name: {"length_wise": int, "width_wise": int,
                             "height_wise": int, "net_qty": int} }
     """
+    from collections import Counter
+    from engine.stacking import build_stacks, stack_height_mm, is_metal_rack, METAL_NEST_MM
+
     CW = float(container["W"])
     CL = float(container["L"])
     CH = float(container["H"])
+    MWT = float(container.get("MAX_WT", float("inf")))
 
-    ordered = sorted(
-        [(r, q) for r, q in load.items() if q > 0],
-        key=lambda x: dims[x[0]]["Length (MM)"],
-        reverse=True,
-    )
+    # Build the same vertical stacks the packer built (heavier at the bottom,
+    # footprint match, stackability / weight / material rules).
+    stacks = build_stacks(load, dims, CH, MWT)
+    # Tile same-footprint stacks together (longest footprint first).
+    stacks.sort(key=lambda s: (s[0]["L"], s[0]["W"]), reverse=True)
 
     records = []
-    counts  = {}
+    positions = []
+    EPS = 1e-6
 
-    # Shared "shelf" cursor. Fill the container WIDTH of a row first (racks
-    # side by side across the width), THEN advance along the LENGTH. This
-    # mirrors how the packer fills a container, so the drawing matches reality:
-    # racks pack 2-, 3-across as they fit and the layout never runs past the
-    # container walls (previously every rack took its own length-row, so many
-    # single-qty racks lined up end-to-end and overflowed the box).
-    cur_y = 0.0   # length position where the current row starts
-    cur_x = 0.0   # width position of the next column in the current row
-    row_L = 0.0   # depth (length) of the current row
-    EPS   = 1e-6
+    # Decide floor placements: a list of (stk, x, y, iW, iL).
+    foots = {(round(s[0]["L"], 1), round(s[0]["W"], 1)) for s in stacks}
+    placed = []
 
-    for r, total_qty in ordered:
-        r_l = float(dims[r]["Length (MM)"])
-        r_w = float(dims[r]["Width (MM)"])
-        r_h = float(dims[r]["Height (MM)"])
-        color = rack_color_map[r]
-        stack = max(1, int(CH // r_h))
+    if len(foots) == 1 and stacks:
+        # ── Single footprint: optimal mixed-orientation column layout ────────
+        # Fill the width with the best mix of a length-wise lane and a
+        # width-wise lane (matches the packer, e.g. 1200x800 -> 10 + 15 = 25).
+        rl, rw = next(iter(foots))
+        capA = int(CL // rl) if rl > 0 else 0      # normal column (width rw)
+        capB = int(CL // rw) if rw > 0 else 0      # rotated column (width rl)
+        best = (0, 0, 0)
+        max_a = int(CW // rw) if rw > 0 else 0
+        for a in range(max_a + 1):
+            rem = CW - a * rw
+            b = int(rem // rl) if rl > 0 else 0
+            if a * capA + b * capB > best[0]:
+                best = (a * capA + b * capB, a, b)
+        _, na, nb = best
 
-        best = None
-        for iW, iL in ((r_w, r_l), (r_l, r_w)):
-            across = int(CW // iW)
-            if across == 0:
-                continue
-            score = (across * stack) / iL
-            if best is None or score > best[3]:
-                best = (iW, iL, across, score)
+        cols = []           # (x, iW, iL, cap)
+        x = 0.0
+        for _ in range(na):
+            cols.append((x, rw, rl, capA)); x += rw
+        for _ in range(nb):
+            cols.append((x, rl, rw, capB)); x += rl
 
-        if best is None:
-            counts[r] = {"length_wise": 0, "width_wise": 0,
-                        "height_wise": 0, "net_qty": 0}
-            continue
-
-        item_W, item_L, fit_across, _ = best
-        per_row = max(1, fit_across * stack)
-
-        remaining = total_qty
-        while remaining > 0:
-            # Start a new row if another column would exceed the container width.
-            if cur_x + item_W > CW + EPS:
-                cur_y += row_L
-                cur_x  = 0.0
-                row_L  = 0.0
-            # One column at (cur_x, cur_y): a vertical stack of up to `stack` units.
-            for layer in range(stack):
-                if remaining <= 0:
+        si = 0
+        for cx, ciW, ciL, cap in cols:
+            for k in range(cap):
+                if si >= len(stacks):
                     break
-                records.append({
-                    "name": r, "color": color,
-                    "x": cur_x, "y": cur_y, "z": layer * r_h,
-                    "iW": item_W, "iL": item_L, "h": r_h,
-                })
-                remaining -= 1
-            row_L = max(row_L, item_L)
-            cur_x += item_W
+                placed.append((stacks[si], cx, k * ciL, ciW, ciL))
+                si += 1
+            if si >= len(stacks):
+                break
+        if si < len(stacks):                        # safety fallback (rare)
+            sky = [[0.0, CW, 0.0]]
+            for _, cx, cy, ciW, ciL in placed:
+                _sky_raise(sky, cx, cx + ciW,
+                           max(_sky_base(sky, cx, ciW), cy + ciL))
+            for j in range(si, len(stacks)):
+                iW, iL = (rw, rl) if rw <= CW else (rl, rw)
+                xx, yy = _sky_place(sky, iW, iL, CW, CL)
+                placed.append((stacks[j], xx, yy, iW, iL))
+    else:
+        # ── Mixed footprints: prefer the LANE layout (matches the packer, and
+        #    finds tight complementary-lane fits). If it can't place every stack
+        #    within the walls, fall back to skyline, then to the MaxRects packer.
+        stack_tuples = [(s[0]["L"], s[0]["W"], sum(b["wt"] for b in s), i)
+                        for i, s in enumerate(stacks)]
+        from engine.geometry import lane_layout
+        placed = None
+        for mode in ("maxdim", "area", "mindim"):
+            for bias in ("wide", "narrow"):
+                pl, lo = lane_layout(stack_tuples, CW, CL, float("inf"),
+                                     mode, bias)
+                if (not lo and pl
+                        and max(y + b for (k, x, y, a, b) in pl) <= CL + 1.0
+                        and max(x + a for (k, x, y, a, b) in pl) <= CW + 1.0):
+                    placed = [(stacks[k], x, y, a, b)
+                              for (k, x, y, a, b) in pl]
+                    break
+            if placed is not None:
+                break
 
+        if placed is None:
+            placed = _skyline_layout(stacks, CW, CL)
+            if _max_extent(placed) > CL + EPS:
+                mr = _maxrects_layout(stacks, CW, CL)
+                if mr is not None and _max_extent(mr) < _max_extent(placed):
+                    placed = mr
+
+    # Build per-unit records and per-position entries from the placements.
+    for stk, x, y, iW, iL in placed:
+        z = 0.0
+        prev_mat = None
+        for b in stk:
+            b_mat = b.get("mat", "")
+            # metal racks nest 38.1 mm into the metal rack below, so this box's
+            # bottom drops by that much (keeps the drawing height honest).
+            if prev_mat is not None and is_metal_rack(prev_mat) and is_metal_rack(b_mat):
+                z -= METAL_NEST_MM
+            records.append({
+                "name": b["name"], "color": rack_color_map[b["name"]],
+                "x": x, "y": y, "z": z, "iW": iW, "iL": iL, "h": b["H"],
+            })
+            z += b["H"]
+            prev_mat = b_mat
+        names = [b["name"] for b in stk]
+        cnt = Counter(names)
+        homog = (len(cnt) == 1)
+        positions.append({
+            "x": x, "y": y, "iW": iW, "iL": iL,
+            "members": names, "stack_n": len(names),
+            "rack": names[0] if homog else "MIXED",
+            "homogeneous": homog, "counts": dict(cnt),
+            "height": stack_height_mm(stk),
+            "weight": sum(b["wt"] for b in stk),
+            # Topmost box (stacks are bottom-first/top-last) -- that's what's
+            # actually visible looking straight down, not the bottom one.
+            "color": rack_color_map[names[-1]],
+        })
+
+    # loading order: NOSE (small y) first, then across the width (x)
+    positions.sort(key=lambda p: (round(p["y"], 1), round(p["x"], 1)))
+    for i, p in enumerate(positions, 1):
+        p["seq"] = i
+
+    # ── counts for the summary table ─────────────────────────────────────────
+    # height_wise = tallest run of a rack within a single stack.
+    max_run = {}
+    for stk in stacks:
+        for nm, cnt in Counter(b["name"] for b in stk).items():
+            max_run[nm] = max(max_run.get(nm, 0), cnt)
+
+    counts = {}
+    for r, q in load.items():
+        q = int(q)
+        if q <= 0:
+            continue
+        r_w = float(dims[r]["Width (MM)"])
+        r_l = float(dims[r]["Length (MM)"])
+        a1 = int(CW // r_w) if r_w > 0 else 0
+        a2 = int(CW // r_l) if r_l > 0 else 0
+        fit_across = max(1, a1, a2)
+        height_wise = max(1, max_run.get(r, 1))
+        per = max(1, fit_across * height_wise)
         counts[r] = {
-            "length_wise": -(-total_qty // per_row),   # ceil(qty / per_row)
+            "length_wise": -(-q // per),        # ceil(q / per)
             "width_wise":  fit_across,
-            "height_wise": stack,
-            "net_qty":     total_qty,
+            "height_wise": height_wise,
+            "net_qty":     q,
         }
 
-    return records, counts
+    return records, counts, positions
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -271,10 +463,11 @@ def _draw_footer(fig, logo_path: str | None = None):
              va="center", ha="right")
 
 
-def _add_face(ax, verts, rgb, alpha):
-    poly = Poly3DCollection([verts], alpha=alpha, zsort="average")
+def _add_face(ax, verts, rgb, alpha, zorder=0):
+    poly = Poly3DCollection([verts], alpha=alpha)
     poly.set_facecolor(rgb)
     poly.set_edgecolor("none")
+    poly.set_zorder(zorder)
     ax.add_collection3d(poly)
 
 
@@ -303,7 +496,7 @@ def _draw_container_3d(ax, CW, CL, CH, n_corr=30):
     fxs = [p[0] for p in floor_edge]
     fys = [p[1] for p in floor_edge]
     fzs = [p[2] for p in floor_edge]
-    ax.plot(fxs, fys, fzs, color=_FRAME_COL, lw=1.2, alpha=0.55)
+    ax.plot(fxs, fys, fzs, color=_FRAME_COL, lw=1.8, alpha=0.7, zorder=0)
 
     # Left side wall only (x = 0) — subtle corrugated finish, fewer strips
     sw = CL / n_corr
@@ -329,40 +522,130 @@ def _draw_container_3d(ax, CW, CL, CH, n_corr=30):
         ([CW,CW],[CL,CL],[0,CH]),                    # right-back corner post
     ]
     for xs,ys,zs in edges:
-        ax.plot(xs,ys,zs, color=_FRAME_COL, lw=2.0, alpha=1.0, solid_capstyle="round")
+        ax.plot(xs,ys,zs, color=_FRAME_COL, lw=3.0, alpha=1.0, solid_capstyle="round", zorder=0)
 
 
-def _draw_racks_3d(ax, records):
+def _draw_racks_3d(ax, records, azim=-55, elev=20):
     """
-    Draw ONE solid cuboid per individual rack unit, each with its own thin
-    dark edge outline. This is intentional: an operator loading the
-    container needs to see every physical rack as a distinct box, not an
-    abstracted stack — that's what tells them exactly how many racks go in
-    each position and how they're oriented.
+    Draw ONE solid cuboid per individual rack unit for the ISO view.
 
-    Edge lines are kept thin (0.35pt) and a consistent dark neutral colour
-    so adjacent units read as clearly separate without creating visual
-    clutter at a glance.
+    Only the three CAMERA-FACING faces (top, front, right) are drawn, fully
+    OPAQUE. Draw order is controlled EXPLICITLY via each face's zorder
+    (requires the axes to have `computed_zorder = False`, set in
+    _setup_3d_ax) rather than relying on matplotlib's own automatic 3-D
+    depth sort, which recomputes an approximate order from each polygon's
+    own projected vertices at render time and can override a correct manual
+    painter's-algorithm order.
+
+    Depth is measured from each box's NEAREST corner to the camera (not its
+    centre) -- more robust than a centroid for boxes of very different sizes.
+
+    A single scalar zorder per box is still not enough for every case: two
+    boxes in adjacent lanes (touching in x, i.e. disjoint footprints) can
+    have PROJECTED images that overlap on screen at this oblique angle even
+    though they never overlap in 3-D -- and if one lane runs deeper (in y)
+    than its neighbour, there is no single "which box is nearer" answer that
+    is correct across their whole overlap; part of the deeper box's side
+    face is genuinely hidden behind the neighbour, part of it genuinely
+    isn't. That mismatch is what showed up as one rack looking like it was
+    "interfering with" / floating through another. Rather than guess a
+    single order for the whole face, the RIGHT face is split at the exact
+    depth where a same-height-or-taller neighbouring lane starts covering
+    it, so only the genuinely-hidden slice is dropped and the genuinely-
+    visible remainder still draws cleanly in place.
     """
-    for rec in records:
+    ar, er = math.radians(azim), math.radians(elev)
+    # unit vector from the scene toward the camera
+    vdx = math.cos(er) * math.cos(ar)
+    vdy = math.cos(er) * math.sin(ar)
+    vdz = math.sin(er)
+
+    def _near_depth(rec):
+        nx = rec["x"] + rec["iW"] if vdx > 0 else rec["x"]
+        ny = rec["y"] + rec["iL"] if vdy > 0 else rec["y"]
+        nz = rec["z"] + rec["h"]  if vdz > 0 else rec["z"]
+        return nx * vdx + ny * vdy + nz * vdz
+
+    ordered = sorted(records, key=_near_depth)        # farthest -> nearest
+    BASE_Z = 10                                        # always above the shell (zorder 0)
+    FEPS = 1e-6
+
+    def _right_face_segments(rec):
+        """
+        y-subranges (within this box's own [y, y+iL]) where its right face
+        is NOT covered by a taller-or-equal neighbouring lane touching its
+        right edge. The covered slice would be hidden regardless -- the
+        neighbour's own faces are what's actually visible there -- so it's
+        simply skipped rather than drawn and fought over via zorder.
+        """
+        rx = rec["x"] + rec["iW"]
+        ry0, ry1 = rec["y"], rec["y"] + rec["iL"]
+        rz0, rz1 = rec["z"], rec["z"] + rec["h"]
+        covered = []
+        for other in records:
+            if other is rec or abs(other["x"] - rx) > FEPS:
+                continue
+            oz0, oz1 = other["z"], other["z"] + other["h"]
+            if oz0 <= rz0 + FEPS and oz1 >= rz1 - FEPS:
+                oy0, oy1 = other["y"], other["y"] + other["iL"]
+                lo, hi = max(ry0, oy0), min(ry1, oy1)
+                if hi > lo + FEPS:
+                    covered.append((lo, hi))
+        if not covered:
+            return [(ry0, ry1)]
+        covered.sort()
+        merged = [list(covered[0])]
+        for lo, hi in covered[1:]:
+            if lo <= merged[-1][1] + FEPS:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        segs, cur = [], ry0
+        for lo, hi in merged:
+            if lo > cur + FEPS:
+                segs.append((cur, lo))
+            cur = max(cur, hi)
+        if cur < ry1 - FEPS:
+            segs.append((cur, ry1))
+        return segs
+
+    for i, rec in enumerate(ordered):
         ox, oy, oz = rec["x"], rec["y"], rec["z"]
         rw, rl, rh = rec["iW"], rec["iL"], rec["h"]
         c = _hex_to_rgb01(rec["color"])
-        top, front = _lighten(c,0.30), _lighten(c,0.12)
-        side, back, bot = _darken(c,0.08), _darken(c,0.22), _darken(c,0.35)
-        face_defs = [
-            ([[ox,oy,oz],[ox+rw,oy,oz],[ox+rw,oy+rl,oz],[ox,oy+rl,oz]], bot, 0.92),
-            ([[ox,oy,oz+rh],[ox+rw,oy,oz+rh],[ox+rw,oy+rl,oz+rh],[ox,oy+rl,oz+rh]], top, 0.96),
-            ([[ox,oy,oz],[ox+rw,oy,oz],[ox+rw,oy,oz+rh],[ox,oy,oz+rh]], front, 0.94),
-            ([[ox,oy+rl,oz],[ox+rw,oy+rl,oz],[ox+rw,oy+rl,oz+rh],[ox,oy+rl,oz+rh]], back, 0.90),
-            ([[ox,oy,oz],[ox,oy+rl,oz],[ox,oy+rl,oz+rh],[ox,oy,oz+rh]], side, 0.92),
-            ([[ox+rw,oy,oz],[ox+rw,oy+rl,oz],[ox+rw,oy+rl,oz+rh],[ox+rw,oy,oz+rh]], _darken(side,0.04), 0.92),
+        top    = _lighten(c, 0.28)
+        front  = _lighten(c, 0.04)
+        rightf = _darken(c, 0.16)
+        zo = BASE_Z + i
+
+        faces = [
+            # top
+            ([[ox, oy, oz+rh], [ox+rw, oy, oz+rh],
+              [ox+rw, oy+rl, oz+rh], [ox, oy+rl, oz+rh]], top),
+            # front (-y face, toward the camera)
+            ([[ox, oy, oz], [ox+rw, oy, oz],
+              [ox+rw, oy, oz+rh], [ox, oy, oz+rh]], front),
         ]
-        for verts, fc, alpha in face_defs:
-            poly = Poly3DCollection([verts], alpha=alpha, zsort="average")
+        for verts, fc in faces:
+            poly = Poly3DCollection([verts])
             poly.set_facecolor(fc)
-            poly.set_edgecolor("#2A2A2A")
-            poly.set_linewidth(0.35)
+            poly.set_edgecolor("#1A1A1A")
+            poly.set_linewidth(0.6)
+            poly.set_alpha(1.0)
+            poly.set_zorder(zo)
+            ax.add_collection3d(poly)
+
+        # right face (+x, toward the camera) -- split around any shadowing
+        # neighbour lane instead of drawn whole
+        for y0, y1 in _right_face_segments(rec):
+            verts = [[ox+rw, y0, oz], [ox+rw, y1, oz],
+                     [ox+rw, y1, oz+rh], [ox+rw, y0, oz+rh]]
+            poly = Poly3DCollection([verts])
+            poly.set_facecolor(rightf)
+            poly.set_edgecolor("#1A1A1A")
+            poly.set_linewidth(0.6)
+            poly.set_alpha(1.0)
+            poly.set_zorder(zo)
             ax.add_collection3d(poly)
 
 
@@ -382,6 +665,12 @@ def _setup_3d_ax(fig, subplot, CW, CL, CH, elev, azim, dist=6.2):
     ax.set_axis_off()
     ax.view_init(elev=elev, azim=azim)
     ax.dist = dist
+    # Use our own explicit zorder for draw order (set on every face in
+    # _draw_container_3d / _draw_racks_3d) instead of matplotlib's automatic
+    # per-artist 3-D depth sort, which recomputes an approximate order from
+    # each polygon's own projected vertices at render time and can silently
+    # override a correct manual painter's-algorithm ordering.
+    ax.computed_zorder = False
     return ax
 
 
@@ -410,7 +699,7 @@ def _draw_2d_view(ax, records, container, view: str, title: str):
     CL = float(container["L"]); CW = float(container["W"]); CH = float(container["H"])
     ax.set_facecolor("white")
 
-    BORDER_LW = 0.7
+    BORDER_LW = 0.9
     EDGE_COL  = "#2A2A2A"
 
     if view == "top":
@@ -420,7 +709,7 @@ def _draw_2d_view(ax, records, container, view: str, title: str):
         ax.set_aspect("auto")
         # Horizontal strip: x-axis = LENGTH, y-axis = WIDTH. Neutral background.
         ax.add_patch(mpatches.Rectangle((0,0), CL, CW,
-                     facecolor=_EMPTY_COL, edgecolor=_FRAME_COL, lw=2.0))
+                     facecolor=_EMPTY_COL, edgecolor=_FRAME_COL, lw=3.4))
         seen = {}
         for rec in records:
             key = (round(rec["x"]), round(rec["y"]))
@@ -438,25 +727,19 @@ def _draw_2d_view(ax, records, container, view: str, title: str):
         # Long elevation: x-axis = LENGTH, y-axis = HEIGHT. 'auto' so the LENGTH
         # axis fills the full panel width and matches the TOP view exactly.
         ax.set_aspect("auto")
-        # This view represents looking at the container from beside it
-        # (like watching a truck drive past) — the line of sight runs along
-        # the container WIDTH. Only the FRONT-MOST rack (smallest width
-        # position = closest to the viewer) is visible at each (length,
-        # height) position; racks behind it along the width are hidden.
-        # We keep, for every (y,z) slot, the record with the smallest x.
+        # Looking at the container from beside it (line of sight along the
+        # WIDTH). Draw as a true back-to-front painter's projection: the racks
+        # farthest across the width are drawn first and the nearest last, fully
+        # opaque, so each spot on the elevation shows the colour of the single
+        # front-most rack there — no bleed-through of a rack behind it.
         ax.add_patch(mpatches.Rectangle((0,0), CL, CH,
-                     facecolor=_EMPTY_COL, edgecolor=_FRAME_COL, lw=2.0))
-        seen = {}
-        for rec in records:
-            key = (round(rec["y"]), round(rec["z"]))
-            if key not in seen or rec["x"] < seen[key]["x"]:
-                seen[key] = rec
-        for rec in seen.values():
+                     facecolor=_EMPTY_COL, edgecolor=_FRAME_COL, lw=3.4))
+        for rec in sorted(records, key=lambda r: r["x"], reverse=True):
             c = _hex_to_rgb01(rec["color"])
             ax.add_patch(mpatches.Rectangle(
                 (rec["y"], rec["z"]), rec["iL"], rec["h"],
                 facecolor=_lighten(c,0.08), edgecolor=EDGE_COL,
-                lw=BORDER_LW, alpha=0.97))
+                lw=BORDER_LW, alpha=1.0))
         ax.set_xlim(0, CL); ax.set_ylim(0, CH)
 
     elif view == "side":
@@ -472,7 +755,7 @@ def _draw_2d_view(ax, records, container, view: str, title: str):
         # door-side layer that spans only part of the width shows the deeper
         # rack beside/above it (e.g. green on the left, orange on the right).
         ax.add_patch(mpatches.Rectangle((0,0), CW, CH,
-                     facecolor=_EMPTY_COL, edgecolor=_FRAME_COL, lw=2.0))
+                     facecolor=_EMPTY_COL, edgecolor=_FRAME_COL, lw=3.4))
 
         # Deepest (farthest from the door) first; nearest drawn last on top.
         order = sorted(records, key=lambda r: r["y"],
@@ -520,6 +803,165 @@ def _draw_legend(ax, rack_color_map: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  OPERATOR LOADING FLOOR PLAN  (labelled top view + loading order)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _pos_rack_label(p):
+    """Short rack description for a floor position (handles mixed stacks)."""
+    if p["homogeneous"]:
+        return p["rack"]
+    parts = [(nm if c == 1 else f"{nm} x{c}") for nm, c in p["counts"].items()]
+    return " + ".join(parts)
+
+
+def _draw_top_loading_plan(ax, positions, container):
+    """
+    Operator loading floor plan (plan view, looking straight down).
+      x-axis = container LENGTH, y-axis = container WIDTH.
+    Every floor position gets a loading-order badge, and — where the cell is
+    big enough — the rack ID, footprint orientation and stack height. Small
+    cells show just the badge; the loading table carries the full detail.
+    NOSE (load first) / DOORS (load last) and the loading direction are marked.
+    """
+    CL = float(container["L"]); CW = float(container["W"])
+    ax.set_facecolor("white")
+    ax.set_aspect("auto")
+    ax.add_patch(mpatches.Rectangle((0, 0), CL, CW,
+                 facecolor="#F5F7F5", edgecolor=_FRAME_COL, lw=3.4))
+    ax.set_xlim(0, CL); ax.set_ylim(0, CW * 1.32)
+    ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_visible(False)
+
+    # data-units -> points, so text can be fitted to each cell
+    fig = ax.figure
+    fw_in, fh_in = fig.get_size_inches()
+    bb = ax.get_position()
+    ppx = (bb.width * fw_in * 72.0) / CL
+    ppy = (bb.height * fh_in * 72.0) / (CW * 1.32)
+
+    def _fit(lines, cw_pt, ch_pt, minfs=4.8, maxfs=9.0):
+        chosen = []
+        for ln in lines:
+            trial = chosen + [ln]
+            fs_h = ch_pt / (len(trial) * 1.35 + 0.4)
+            fs_w = min(cw_pt / (max(1, len(t)) * 0.60) for t in trial)
+            if min(fs_h, fs_w) >= minfs:
+                chosen = trial
+            else:
+                break
+        if not chosen:
+            return [], 0.0
+        fs_h = ch_pt / (len(chosen) * 1.35 + 0.4)
+        fs_w = min(cw_pt / (max(1, len(t)) * 0.60) for t in chosen)
+        return chosen, max(minfs, min(maxfs, min(fs_h, fs_w)))
+
+    for p in positions:
+        x0, y0 = p["y"], p["x"]
+        w, h   = p["iL"], p["iW"]
+        c = _hex_to_rgb01(p["color"])
+        ax.add_patch(mpatches.Rectangle((x0, y0), w, h,
+                     facecolor=_lighten(c, 0.12), edgecolor="#222222",
+                     lw=1.1, alpha=0.97))
+        cw_pt, ch_pt = w * ppx, h * ppy
+
+        # Length / width marked as plain numbers at the box's own edges
+        # (length along the top, width rotated along the left) instead of a
+        # combined "L x W" in the centre -- so an operator can tell at a
+        # glance which dimension runs along the container's length vs its
+        # width. No dimension lines/ticks -- just the number. Skipped when
+        # the box is too small to spare the room (the loading table always
+        # has the exact figures).
+        dim_fs   = max(4.2, min(7.0, 0.26 * min(cw_pt, ch_pt)))
+        show_len = cw_pt >= 26 and ch_pt >= 34
+        show_wid = ch_pt >= 26 and cw_pt >= 34
+
+        # Reserve the edge strips BEFORE sizing the main label, and shrink
+        # the region the label/badge are allowed to use accordingly -- this
+        # is what actually keeps every piece of text inside its own box
+        # instead of drifting into the strip (or a neighbouring cell) at
+        # small sizes.
+        top_strip_pt  = dim_fs * 1.6 if show_len else 0.0
+        left_strip_pt = dim_fs * 1.6 if show_wid else 0.0
+        top_strip  = min(h * 0.35, top_strip_pt / ppy) if ppy else 0.0
+        left_strip = min(w * 0.35, left_strip_pt / ppx) if ppx else 0.0
+
+        ix0, iy0 = x0 + left_strip, y0
+        iw, ih   = w - left_strip, h - top_strip
+        icw_pt, ich_pt = iw * ppx, ih * ppy
+
+        lines = [p["rack"] if p["homogeneous"] else "MIX"]
+        if p["stack_n"] > 1:
+            lines.append(f'x{p["stack_n"]} high')
+        shown, fs = _fit(lines, icw_pt, ich_pt)
+
+        badge_fs = max(5.5, min(11.0, 0.38 * min(icw_pt, ich_pt)))
+
+        if show_len:
+            ax.text(x0 + w * 0.5, y0 + h - top_strip * 0.5, f'{int(round(w))}',
+                    fontsize=dim_fs, fontweight="bold", color="#111111",
+                    ha="center", va="center", zorder=4)
+        if show_wid:
+            ax.text(x0 + left_strip * 0.5, y0 + h * 0.5, f'{int(round(h))}',
+                    fontsize=dim_fs, fontweight="bold", color="#111111",
+                    ha="center", va="center", rotation=90, zorder=4)
+
+        if shown:
+            ax.text(ix0 + iw * 0.5, iy0 + ih * 0.40, "\n".join(shown),
+                    fontsize=fs, fontweight="bold", color="#111111",
+                    ha="center", va="center", linespacing=1.2, zorder=4)
+            ax.text(ix0 + iw * 0.86, iy0 + ih * 0.15, str(p["seq"]),
+                    fontsize=badge_fs, fontweight="bold", color="white",
+                    ha="center", va="center", zorder=5,
+                    bbox=dict(boxstyle="circle,pad=0.22", fc="#1A1A1A", ec="white", lw=0.5))
+        else:
+            ax.text(x0 + w * 0.5, y0 + h * 0.5, str(p["seq"]),
+                    fontsize=badge_fs, fontweight="bold", color="white",
+                    ha="center", va="center", zorder=5,
+                    bbox=dict(boxstyle="circle,pad=0.22", fc="#1A1A1A", ec="white", lw=0.5))
+
+    # end markers + loading direction (above the container)
+    ax.text(CL * 0.02, CW * 1.15, "NOSE\n(load 1st)", fontsize=8.5,
+            fontweight="bold", color="#245A1C", ha="left", va="bottom")
+    ax.text(CL * 0.98, CW * 1.15, "DOORS\n(load last)", fontsize=8.5,
+            fontweight="bold", color="#C0392B", ha="right", va="bottom")
+    ax.annotate("", xy=(CL * 0.66, CW * 1.09), xytext=(CL * 0.34, CW * 1.09),
+                arrowprops=dict(arrowstyle="-|>", lw=2.0, color="#555555"))
+    ax.text(CL * 0.5, CW * 1.14, "loading order", fontsize=7.5, style="italic",
+            color="#555555", ha="center", va="bottom")
+
+
+def _auto_col_widths(col_labels, rows_data, pad=1.6, min_frac=0.055):
+    """
+    Column widths proportional to the longest string actually in each column
+    (header included), instead of fixed fractions that waste space on short
+    columns (e.g. 'Qty') while cramping long ones (e.g. 'Rack ID' with mixed
+    labels). `pad` is extra character-widths of breathing room per column;
+    `min_frac` is a floor so no column collapses to nothing.
+    """
+    ncols = len(col_labels)
+    maxlen = [len(str(col_labels[j])) for j in range(ncols)]
+    for row in rows_data:
+        for j, val in enumerate(row):
+            maxlen[j] = max(maxlen[j], len(str(val)))
+    weights = [maxlen[j] + pad for j in range(ncols)]
+    total = sum(weights)
+    fracs = [w / total for w in weights]
+    # enforce the floor, then renormalise so everything still sums to 1.0
+    deficit = sum(max(0.0, min_frac - f) for f in fracs)
+    if deficit > 0:
+        scale = 1.0 - deficit
+        fracs = [max(min_frac, f) if f >= min_frac else min_frac for f in fracs]
+        surplus_cols = [j for j, f in enumerate(fracs) if f > min_frac]
+        over = sum(fracs) - 1.0
+        if surplus_cols and over > 0:
+            per = over / len(surplus_cols)
+            for j in surplus_cols:
+                fracs[j] -= per
+    return fracs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FULL PAGE RENDERER  (matches reference PPT layout exactly)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -542,7 +984,7 @@ def render_container_page(
     """
     CW = float(container["W"]); CL = float(container["L"]); CH = float(container["H"])
 
-    records, counts = _build_layout_and_counts(load, dims, container, rack_color_map)
+    records, counts, positions = _build_layout_and_counts(load, dims, container, rack_color_map)
 
     cont_wt = sum(load.get(r,0)*dims[r]["Weight (Kg)"] for r in load)
 
@@ -550,8 +992,8 @@ def render_container_page(
 
     gs = GridSpec(
         4, 2,
-        height_ratios=[0.07, 0.30, 0.34, 0.24],
-        width_ratios=[0.56, 0.44],
+        height_ratios=[0.06, 0.37, 0.32, 0.22],
+        width_ratios=[0.50, 0.50],
         figure=fig,
         hspace=0.42, wspace=0.08,
         left=0.02, right=0.98, top=0.95, bottom=0.135,
@@ -561,46 +1003,53 @@ def render_container_page(
     suffix = f"  (Container {container_number}/{total_containers})" if total_containers > 1 else ""
     ax_title = fig.add_subplot(gs[0, :])
     ax_title.axis("off")
-    ax_title.text(0.0, 0.5, f"Density Analysis - {container_label}{suffix}",
+    ax_title.text(0.0, 0.5, f"Loading Plan - {container_label}{suffix}",
                   fontsize=20, fontweight="bold", color=_JD_GREEN,
                   va="center", ha="left", transform=ax_title.transAxes)
 
-    # ── Summary table (top-left) ─────────────────────────────────────────────
+    # ── Loading sequence table (top-left) — what the operator actually does ───
     ax_tbl = fig.add_subplot(gs[1, 0])
     ax_tbl.axis("off")
 
-    col_labels = ["Rack ID", "Length\nWise", "Width\nWise", "Height\nWise",
-                  "Net\nQuantity", "Package\nWeight", "Net Container\nWeight (KG)"]
+    col_labels = ["Seq", "Rack ID", "Qty", "Orient (mm)", "Stack", "Wt (kg)"]
     rows_data = []
-    for r in sorted(load.keys()):
-        c = counts.get(r, {"length_wise":0,"width_wise":0,"height_wise":0,"net_qty":0})
-        unit_wt = dims[r]["Weight (Kg)"]
+    for p in sorted(positions, key=lambda z: z["seq"]):
         rows_data.append([
-            r, str(c["length_wise"]), str(c["width_wise"]), str(c["height_wise"]),
-            str(c["net_qty"]), f"{unit_wt:.0f}", f"{c['net_qty']*unit_wt:,.0f}",
+            str(p["seq"]),
+            _pos_rack_label(p),
+            str(p["stack_n"]),
+            f'{int(round(p["iL"]))} x {int(round(p["iW"]))}',
+            (f'x{p["stack_n"]}' if p["stack_n"] > 1 else "1"),
+            f'{p["weight"]:,.0f}',
         ])
-    total_qty = sum(counts.get(r,{}).get("net_qty",0) for r in load)
-    rows_data.append(["TOTAL", "", "", "", str(total_qty), "", f"{cont_wt:,.0f}"])
+    rows_data.append(["", "TOTAL", str(sum(p["stack_n"] for p in positions)),
+                      "", "", f"{cont_wt:,.0f}"])
+    col_widths = _auto_col_widths(col_labels, rows_data)
 
-    # Size the table to fit its panel no matter how many racks are in the
-    # container (a bbox in axes-fraction coords overrides per-row auto-height,
-    # so 14+ rows no longer overflow into the views below). Font shrinks a
-    # little as the row count grows.
-    n_total = len(rows_data) + 1                      # data rows + header
-    row_h   = 0.095
+    n_total = len(rows_data) + 1
+    row_h   = 0.115
     tbl_h   = min(1.0, n_total * row_h)
+    tbl_bottom = (1.0 - tbl_h) / 2.0   # centre vertically -- spare room split
+                                       # above AND below instead of dumped
+                                       # entirely under the table
     tbl = ax_tbl.table(cellText=rows_data, colLabels=col_labels,
-                       cellLoc="center", loc="upper center",
-                       bbox=[0.0, 1.0 - tbl_h, 1.0, tbl_h])
+                       colWidths=col_widths, cellLoc="center", loc="upper center",
+                       bbox=[0.0, tbl_bottom, 1.0, tbl_h])
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8.5 if n_total <= 11 else max(5.5, 8.5 * 11.0 / n_total))
+    tbl.set_fontsize(9.5 if n_total <= 10 else max(5.5, 9.5 * 10.0 / n_total))
+    # left-align the Rack ID column so long mixed labels read cleanly
+    for i in range(len(rows_data) + 1):
+        cell = tbl[i, 1]
+        cell.set_text_props(ha="left")
+        cell.PAD = 0.03
     for j in range(len(col_labels)):
-        tbl[0, j].set_facecolor("#D9D9D9")
-        tbl[0, j].set_text_props(fontweight="bold", color="#1A1A1A")
+        tbl[0, j].set_facecolor("#367C2B")
+        tbl[0, j].set_text_props(fontweight="bold", color="white",
+                                 ha=("left" if j == 1 else "center"))
     last_row = len(rows_data)
     for j in range(len(col_labels)):
         tbl[last_row, j].set_text_props(fontweight="bold")
-        tbl[last_row, j].set_facecolor("#F0F0F0")
+        tbl[last_row, j].set_facecolor("#EAF2E7")
 
     # ── ISO view (top-right) ─────────────────────────────────────────────────
     # Mirror the layout along the container LENGTH for the ISO only, so the
@@ -619,10 +1068,11 @@ def render_container_page(
     ax_iso.text2D(0.5, -0.10, "ISO VIEW", transform=ax_iso.transAxes,
                   fontsize=11, fontweight="bold", ha="center", color="#1A1A1A")
 
-    # ── Top view (mid-left, wide) ────────────────────────────────────────────
+    # ── Loading floor plan (mid-left, wide) — the operator's main view ───────
     ax_top = fig.add_subplot(gs[2, 0])
-    _draw_2d_view(ax_top, records, container, "top", "")
-    ax_top.text(0.5, -0.18, "TOP VIEW", transform=ax_top.transAxes,
+    _draw_top_loading_plan(ax_top, positions, container)
+    ax_top.text(0.5, -0.14, "LOADING FLOOR PLAN  (top view)",
+               transform=ax_top.transAxes,
                fontsize=12, fontweight="bold", ha="center", color="#1A1A1A")
 
     # ── Side view (mid-right) ────────────────────────────────────────────────
@@ -743,39 +1193,35 @@ def container_label_from_type(container_type: str) -> str:
 def add_download_buttons(st, containers, dims, container_spec,
                          container_type: str = "40 HC",
                          pdf_only: bool = True,
-                         logo_path: str | None = None):
+                         logo_path: str | None = None,
+                         pdf_bytes: bytes | None = None):
     """
     Add the PDF download button to a Streamlit app.
 
     `container_type` can be your raw dropdown value (e.g. "40HC", "20 GP");
-    it is normalised automatically to e.g. "40 HC" for the title, which is
-    rendered inside the report as "Density Analysis - {label}".
+    it is normalised automatically to e.g. "40 HC" for the title.
 
-    No shipment/route info (origin, destination) is shown anywhere in the
-    report — only container + rack loading data.
+    pdf_bytes : if the PDF was already generated (recommended — generate it
+                once when the user clicks Calculate and cache it in
+                st.session_state), pass it here so the button serves it
+                instantly and does NOT rebuild the PDF on every rerun. If left
+                None, the PDF is built here and a "generating" message is shown.
 
-    Only the PDF is offered (the PPTX export was removed since the slides
-    aren't editable). `pdf_only` is kept for backward compatibility but is
-    now always effectively True.
-
-    Parameters
-    ----------
-    logo_path : optional explicit path to the footer logo. If omitted, the
-                report looks for assets/john_deere_footer.png automatically.
-
-    Usage:
-        from engine.container_report import add_download_buttons
-        add_download_buttons(st, containers, dims, container_spec,
-                             container_type=container_type)
+    Only the PDF is offered (the PPTX export was removed). `pdf_only` is kept
+    for backward compatibility but is now always effectively True.
     """
     label = container_label_from_type(container_type)
 
-    try:
-        pdf = generate_pdf(containers, dims, container_spec,
-                           container_label=label, logo_path=logo_path)
-        st.download_button(
-            "📄 Download PDF", pdf,
-            f"density_analysis_{label.replace(' ','_')}.pdf",
-            "application/pdf", use_container_width=True)
-    except Exception as e:
-        st.error(f"PDF error: {e}")
+    if pdf_bytes is None:
+        try:
+            with st.spinner("Generating PDF report… this can take a few seconds."):
+                pdf_bytes = generate_pdf(containers, dims, container_spec,
+                                         container_label=label, logo_path=logo_path)
+        except Exception as e:
+            st.error(f"PDF error: {e}")
+            return
+
+    st.download_button(
+        "📄 Download PDF", pdf_bytes,
+        f"density_analysis_{label.replace(' ', '_')}.pdf",
+        "application/pdf", use_container_width=True)

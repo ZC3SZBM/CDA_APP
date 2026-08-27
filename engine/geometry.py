@@ -96,6 +96,81 @@ class Rect:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+def lane_layout(stacks, CW, CL, MWT=float("inf"), sort_mode="maxdim",
+                lane_bias="wide", EPS=1.0):
+    """
+    Pack footprints into LANES that run along the container LENGTH.
+
+    Each lane has a fixed width; footprints are dropped into a lane along the
+    length (choosing, per footprint, the orientation whose cross dimension best
+    fills the lane so the least length is used), and new lanes are opened across
+    the WIDTH as needed.
+
+    lane_bias controls how WIDE a new lane is opened:
+      "wide"   -> a new lane takes the footprint's LARGER side across the width
+                  (good when two footprints' larger sides fill the width, e.g.
+                  1193.8 + 1092.2 = 2286).
+      "narrow" -> a new lane takes the footprint's SMALLER side across the width
+                  (good when several footprints' smaller sides tile the width,
+                  e.g. 889 + 762 + 635 = 2286, racks turned lengthwise).
+    Both are tried by callers and the fewest-container / best-fitting result is
+    kept, so tight arrangements a rectangle packer misses are found.
+
+    stacks    : list of (L, W, weight, key) tuples (key identifies the stack).
+    returns   : (placements, leftover)
+                placements = [(key, x, y, iW, iL), ...]  (x=width pos, y=length pos)
+                leftover   = the (L,W,weight,key) tuples that did not fit.
+    """
+    if sort_mode == "maxdim":
+        keyf = lambda s: max(s[0], s[1])
+    elif sort_mode == "area":
+        keyf = lambda s: s[0] * s[1]
+    else:                       # "mindim"
+        keyf = lambda s: min(s[0], s[1])
+    order = sorted(stacks, key=keyf, reverse=True)
+
+    lanes = []                  # {x, w, y}
+    placements, leftover = [], []
+    used_w, weight = 0.0, 0.0
+
+    for st in order:
+        L, W, wt, k = st
+        if weight + wt > MWT + EPS:
+            leftover.append(st)
+            continue
+        done = False
+        # 1) try to drop into an existing lane (widest cross that fits => least length)
+        for lane in lanes:
+            opts = [(a, b) for (a, b) in ((W, L), (L, W))
+                    if a <= lane["w"] + EPS and lane["y"] + b <= CL + EPS]
+            if opts:
+                a, b = max(opts, key=lambda o: o[0])
+                placements.append((k, lane["x"], lane["y"], a, b))
+                lane["y"] += b
+                weight += wt
+                done = True
+                break
+        if done:
+            continue
+        # 2) open a new lane across the remaining width, per the bias
+        rem = CW - used_w
+        opts = [(a, b) for (a, b) in ((W, L), (L, W))
+                if a <= rem + EPS and b <= CL + EPS]
+        if not opts:
+            leftover.append(st)
+            continue
+        if lane_bias == "narrow":
+            a, b = min(opts, key=lambda o: o[0])   # narrowest lane
+        else:
+            a, b = max(opts, key=lambda o: o[0])   # widest lane
+        lanes.append({"x": used_w, "w": a, "y": b})
+        placements.append((k, used_w, 0.0, a, b))
+        used_w += a
+        weight += wt
+
+    return placements, leftover
+
+
 class MaxRectsBin:
     """
     2-D floor bin-packer using guillotine splits + Best-Short-Side-Fits.
@@ -182,6 +257,39 @@ class MaxRectsBin:
         self.free.extend(new_parts)
         self._prune()
         return True
+
+    def place_located(self, item_W: float, item_L: float,
+                      allow_rotate: bool = True):
+        """
+        Same placement rule as place(), but RETURNS where the item was put:
+        (x, y, w, h) — x along width, y along length, w/h the placed extents
+        (w/h swapped if it was rotated). Returns None if it did not fit.
+        Used by the report so its drawing matches the packer's own layout.
+        """
+        best_fr = None
+        best_sc = None
+        best_iW = item_W
+        best_iL = item_L
+        orientations = (((item_W, item_L), (item_L, item_W))
+                        if allow_rotate else ((item_W, item_L),))
+        for fr in self.free:
+            for iW, iL in orientations:
+                if not fr.fits(iW, iL):
+                    continue
+                score = min(fr.rw - iW, fr.rl - iL)
+                if best_fr is None or score < best_sc:
+                    best_fr = fr
+                    best_sc = score
+                    best_iW = iW
+                    best_iL = iL
+        if best_fr is None:
+            return None
+        x, y = best_fr.x, best_fr.y
+        new_parts = best_fr.split(best_iW, best_iL)
+        self.free.remove(best_fr)
+        self.free.extend(new_parts)
+        self._prune()
+        return (x, y, best_iW, best_iL)
 
     def free_area(self) -> float:
         return sum(r.area() for r in self.free)
