@@ -356,17 +356,19 @@ def render_upload_section():
         return _clean_numeric_columns(df[ALL_INPUT_COLUMNS].copy())
 
     st.markdown("<div style='margin-top:-6px'></div>", unsafe_allow_html=True)
-    st.info("No file uploaded. Enter rack details manually below \U0001F447")
-    st.caption(
-        "\U0001F4A1 You can type a formula in any dimension/weight cell \u2014 it converts on Enter. "
-        "e.g. **45*25.4** (in\u2192mm), **3*304.8** (ft\u2192mm), "
-        "**12*10** (cm\u2192mm), **120*0.453592** (lb\u2192kg)."
-    )
-    st.caption(
-        "\U0001F4CF **Note:** If a rack / package is shipped in **folded condition**, "
-        "enter its **folded height** in the Height (MM) column.  "
-        "**Packaging Material is required** for every rack."
-    )
+    st.info("No file uploaded \u2014 enter rack details manually below \U0001F447")
+    with st.expander("\u2139\ufe0f  Input tips  \u2014  formulas, folded height, "
+                     "max units per container"):
+        st.markdown(
+            "- **Formulas allowed** in any dimension/weight cell (converts on Enter): "
+            "`45*25.4` in\u2192mm \u2022 `3*304.8` ft\u2192mm \u2022 `12*10` cm\u2192mm \u2022 "
+            "`120*0.453592` lb\u2192kg\n"
+            "- **Folded height:** if a rack ships folded, enter its **folded** height.\n"
+            "- **Packaging Material is required** for every rack (it sets the "
+            "stacking / weight capacity).\n"
+            "- **Max units per container:** enter **one** package Details(L,W,H, Weight,Material), leave Quantity "
+            "blank, and click **Calculate Loading**."
+        )
 
     # Source-of-truth dataframe fed to the editor. We keep it in session_state
     # so we can write evaluated results back into the cells. Rebuild it if it's
@@ -400,7 +402,10 @@ def render_upload_section():
         column_config={
             "Rack / Finished Good": st.column_config.TextColumn("Rack / Finished Good"),
             "Quantity": st.column_config.NumberColumn(
-                "Quantity", min_value=1, step=1, format="%d"
+                "Quantity", min_value=0, step=1, format="%d",
+                help=("How many of this rack to ship. Entering ONE package and "
+                      "leaving Quantity blank/0 asks 'how many fit in one "
+                      "container?' instead."),
             ),
             "Length (MM)": st.column_config.TextColumn("Length (MM)", help=_help),
             "Width (MM)": st.column_config.TextColumn("Width (MM)", help=_help),
@@ -533,21 +538,22 @@ def render_results(
         except Exception:
             max_units, detail = 0, {"error": "Could not compute capacity."}
         with st.container(border=True):
-            st.markdown("#### \U0001F4E6 Container capacity for this package")
+            st.markdown("### \U0001F9EE Maximum units per container")
             if max_units <= 0:
                 st.error(detail.get("error", "This package does not fit."))
             else:
                 a, b, c = st.columns(3)
-                a.metric("Max units per container", max_units)
-                b.metric("Stacks on floor", detail["stacks"])
-                c.metric("Units per stack (max)", detail["per_stack"])
-                st.caption(
-                    f"One full container holds **{max_units}** units \u2014 "
+                a.metric(f"Max {str(row.get('Rack / Finished Good','package'))} "
+                         f"per {container_type}", max_units)
+                b.metric("Floor positions", detail["stacks"])
+                c.metric("Units per stack", detail["per_stack"])
+                st.success(
+                    f"**{max_units} units** fit in one **{container_type}** \u2014 "
                     f"{detail['stacks']} floor positions stacked up to "
-                    f"{detail['per_stack']} high, "
-                    f"{detail['total_weight']:,.0f} kg "
-                    f"({detail['weight_pct']:.0f}% of the weight limit), "
-                    f"{detail['volume_pct']:.0f}% of the volume. "
+                    f"{detail['per_stack']} high. "
+                    f"Weight {detail['total_weight']:,.0f} kg "
+                    f"({detail['weight_pct']:.0f}% of limit), "
+                    f"volume {detail['volume_pct']:.0f}%. "
                     f"Limited by **{detail['limited_by']}**."
                 )
 
