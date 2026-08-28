@@ -187,6 +187,57 @@ def _maxrects_layout(stacks, CW, CL):
     return out
 
 
+def _block_layout(stacks, CW, CL):
+    """
+    Group each rack footprint into a compact rectangular BLOCK (a grid of that
+    rack, oriented to fit the most across the width in the shortest length),
+    then pack the few blocks into the container with the MaxRects packer. This
+    finds arrangements that fixed full-length lanes miss — e.g. a 2-wide block
+    of long racks up front with a block of sideways racks filling the back.
+    Returns [(stk, x, y, iW, iL)] or None if the blocks don't all fit.
+    """
+    from collections import defaultdict
+    from engine.geometry import MaxRectsBin
+    groups = defaultdict(list)
+    for s in stacks:
+        groups[(round(s[0]["L"], 1), round(s[0]["W"], 1))].append(s)
+
+    blocks = []
+    for (L, W), members in groups.items():
+        N = len(members)
+        best = None
+        for across, along in ((W, L), (L, W)):
+            cols = int(CW // across)
+            if cols < 1:
+                continue
+            rows = -(-N // cols)            # ceil
+            bL = rows * along
+            if bL > CL + 1.0:
+                continue
+            if best is None or bL < best[0]:
+                best = (bL, across, along, cols, cols * across)
+        if best is None:
+            return None
+        bL, across, along, cols, bW = best
+        blocks.append({"W": bW, "L": bL, "members": members,
+                       "across": across, "along": along, "cols": cols})
+
+    binp = MaxRectsBin(CW, CL)
+    blocks.sort(key=lambda b: b["W"] * b["L"], reverse=True)
+    placed = []
+    for b in blocks:
+        r = binp.place_located(b["W"], b["L"], allow_rotate=False)
+        if r is None:
+            return None
+        bx, by, _bw, _bl = r
+        for j, s in enumerate(b["members"]):
+            col = j % b["cols"]
+            row = j // b["cols"]
+            placed.append((s, bx + col * b["across"], by + row * b["along"],
+                           b["across"], b["along"]))
+    return placed
+
+
 def _max_extent(placed):
     return max((y + iL) for _, x, y, iW, iL in placed) if placed else float("inf")
 
@@ -273,20 +324,21 @@ def _build_layout_and_counts(load: dict, dims: dict, container: dict,
         #    within the walls, fall back to skyline, then to the MaxRects packer.
         stack_tuples = [(s[0]["L"], s[0]["W"], sum(b["wt"] for b in s), i)
                         for i, s in enumerate(stacks)]
-        from engine.geometry import lane_layout
-        placed = None
-        for mode in ("maxdim", "area", "mindim"):
-            for bias in ("wide", "narrow"):
-                pl, lo = lane_layout(stack_tuples, CW, CL, float("inf"),
-                                     mode, bias)
-                if (not lo and pl
-                        and max(y + b for (k, x, y, a, b) in pl) <= CL + 1.0
-                        and max(x + a for (k, x, y, a, b) in pl) <= CW + 1.0):
-                    placed = [(stacks[k], x, y, a, b)
-                              for (k, x, y, a, b) in pl]
-                    break
-            if placed is not None:
-                break
+        from engine.geometry import find_layout
+
+        # ONE shared layout finder, also used by the packer to validate each
+        # container — so whatever the packer says fits, we can draw inside the
+        # walls. Only if that somehow fails do we fall back to the older
+        # layouts (which may not fill as tightly).
+        pl = find_layout(stack_tuples, CW, CL)
+        if pl is not None:
+            placed = [(stacks[k], x, y, a, b) for (k, x, y, a, b) in pl]
+        else:
+            placed = _skyline_layout(stacks, CW, CL)
+            if _max_extent(placed) > CL + EPS:
+                mr = _maxrects_layout(stacks, CW, CL)
+                if mr is not None and _max_extent(mr) < _max_extent(placed):
+                    placed = mr
 
         if placed is None:
             placed = _skyline_layout(stacks, CW, CL)
@@ -991,9 +1043,9 @@ def render_container_page(
     fig = plt.figure(figsize=figsize, facecolor="white")
 
     gs = GridSpec(
-        4, 2,
-        height_ratios=[0.06, 0.37, 0.32, 0.22],
-        width_ratios=[0.50, 0.50],
+        5, 2,
+        height_ratios=[0.06, 0.33, 0.29, 0.20, 0.12],
+        width_ratios=[0.52, 0.48],
         figure=fig,
         hspace=0.42, wspace=0.08,
         left=0.02, right=0.98, top=0.95, bottom=0.135,
@@ -1062,11 +1114,11 @@ def render_container_page(
         m["y"] = CL - (rec["y"] + rec["iL"])
         iso_records.append(m)
 
-    ax_iso = _setup_3d_ax(fig, gs[1, 1], CW, CL, CH, elev=20, azim=-55, dist=6.0)
+    ax_iso = _setup_3d_ax(fig, gs[1:3, 1], CW, CL, CH, elev=20, azim=-55, dist=5.4)
     _draw_container_3d(ax_iso, CW, CL, CH)
     _draw_racks_3d(ax_iso, iso_records)
-    ax_iso.text2D(0.5, -0.10, "ISO VIEW", transform=ax_iso.transAxes,
-                  fontsize=11, fontweight="bold", ha="center", color="#1A1A1A")
+    ax_iso.text2D(0.5, -0.06, "ISO VIEW", transform=ax_iso.transAxes,
+                  fontsize=12, fontweight="bold", ha="center", color="#1A1A1A")
 
     # ── Loading floor plan (mid-left, wide) — the operator's main view ───────
     ax_top = fig.add_subplot(gs[2, 0])
@@ -1075,8 +1127,8 @@ def render_container_page(
                transform=ax_top.transAxes,
                fontsize=12, fontweight="bold", ha="center", color="#1A1A1A")
 
-    # ── Side view (mid-right) ────────────────────────────────────────────────
-    ax_side = fig.add_subplot(gs[2, 1])
+    # ── Side view (row 3, right) ─────────────────────────────────────────────
+    ax_side = fig.add_subplot(gs[3, 1])
     _draw_2d_view(ax_side, records, container, "side", "")
     ax_side.text(0.5, -0.10, "SIDE VIEW", transform=ax_side.transAxes,
                 fontsize=12, fontweight="bold", ha="center", color="#1A1A1A")
@@ -1087,8 +1139,8 @@ def render_container_page(
     ax_front.text(0.5, -0.15, "FRONT VIEW", transform=ax_front.transAxes,
                  fontsize=12, fontweight="bold", ha="center", color="#1A1A1A")
 
-    # ── Legend (bottom-right) — ONLY the racks loaded in THIS container ──────
-    ax_legend = fig.add_subplot(gs[3, 1])
+    # ── Legend (bottom strip, full width) — ONLY racks in THIS container ─────
+    ax_legend = fig.add_subplot(gs[4, :])
     local_color_map = {
         r: rack_color_map[r]
         for r in sorted(load)

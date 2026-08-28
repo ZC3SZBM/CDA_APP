@@ -171,6 +171,193 @@ def lane_layout(stacks, CW, CL, MWT=float("inf"), sort_mode="maxdim",
     return placements, leftover
 
 
+def shelf_layout(stacks, CW, CL, MWT=float("inf"), sort_mode="maxdim", EPS=1.0):
+    """
+    Shelf/row packing along the container LENGTH.
+
+    Footprints are laid in rows across the WIDTH; when a row fills, the next row
+    starts further along the length. Each footprint is turned to the orientation
+    that packs the most per row for the least length (its column-efficient
+    orientation). This finds "sectioned" fits a lane packer misses — e.g. four
+    rows of two 1143-wide racks, then rows of one 1626-wide rack — keeping
+    everything inside the walls.
+
+    stacks  : list of (L, W, weight, key) tuples.
+    returns : (placements, leftover); placements = [(key, x, y, iW, iL), ...].
+    """
+    if sort_mode == "area":
+        keyf = lambda s: s[0] * s[1]
+    elif sort_mode == "mindim":
+        keyf = lambda s: min(s[0], s[1])
+    else:                       # "maxdim"
+        keyf = lambda s: max(s[0], s[1])
+    order = sorted(stacks, key=keyf, reverse=True)
+
+    def best_orient(L, W):
+        best = None
+        for across, along in ((W, L), (L, W)):
+            if across <= CW + EPS:
+                per = int((CW + EPS) // across)
+                if per >= 1:
+                    cost = along / per          # length used per stack
+                    if best is None or cost < best[0]:
+                        best = (cost, across, along)
+        return best
+
+    placements, leftover = [], []
+    y = 0.0                      # length position of current row
+    row_x = 0.0                  # width filled in current row
+    row_depth = 0.0              # deepest stack in current row
+    weight = 0.0
+
+    for st in order:
+        L, W, wt, k = st
+        if weight + wt > MWT + EPS:
+            leftover.append(st)
+            continue
+        # Candidate orientations, most space-efficient first, but ALWAYS try the
+        # other one as a fallback — otherwise a rack whose preferred orientation
+        # is too deep for the remaining length gets dropped (and later drawn
+        # outside the container) even though it would fit turned the other way.
+        cands = []
+        for across, along in ((W, L), (L, W)):
+            if across <= CW + EPS:
+                per = max(1, int((CW + EPS) // across))
+                cands.append((along / per, across, along))
+        cands.sort()
+        if not cands:
+            leftover.append(st)
+            continue
+
+        placed = False
+        # 1) fit in the current row
+        for _c, across, along in cands:
+            if row_x + across <= CW + EPS and y + along <= CL + EPS:
+                placements.append((k, row_x, y, across, along))
+                row_x += across
+                row_depth = max(row_depth, along)
+                weight += wt
+                placed = True
+                break
+        if placed:
+            continue
+        # 2) start a new row
+        ny = y + row_depth
+        for _c, across, along in cands:
+            if across <= CW + EPS and ny + along <= CL + EPS:
+                y, row_x, row_depth = ny, 0.0, along
+                placements.append((k, 0.0, y, across, along))
+                row_x = across
+                weight += wt
+                placed = True
+                break
+        if not placed:
+            leftover.append(st)
+
+    return placements, leftover
+
+
+def maxrects_layout_all(stacks, CW, CL, sort_key=None, EPS=1e-6):
+    """
+    TRUE MaxRects placement (not guillotine): when an item is placed, every free
+    rectangle it overlaps is split into up to four maximal rectangles, and
+    contained rectangles are pruned. This keeps far more usable space than the
+    guillotine split and fits loads the simpler packer cannot.
+
+    Returns [(key, x, y, iW, iL), ...] or None if any footprint cannot be placed.
+    """
+    if sort_key is None:
+        sort_key = lambda s: s[0] * s[1]
+    free = [(0.0, 0.0, CW, CL)]
+
+    def prune(fs):
+        out = []
+        for i, a in enumerate(fs):
+            contained = False
+            for j, b in enumerate(fs):
+                if i != j and (b[0] <= a[0] + EPS and b[1] <= a[1] + EPS
+                               and b[0] + b[2] >= a[0] + a[2] - EPS
+                               and b[1] + b[3] >= a[1] + a[3] - EPS):
+                    # keep only one of two identical rects
+                    if (b[2] * b[3] > a[2] * a[3]) or (j < i):
+                        contained = True
+                        break
+            if not contained:
+                out.append(a)
+        return out
+
+    placements = []
+    for st in sorted(stacks, key=sort_key, reverse=True):
+        L, W = st[0], st[1]
+        k = st[-1]
+        best = None
+        for (fx, fy, fw, fl) in free:
+            for (a, b) in ((W, L), (L, W)):
+                if a <= fw + EPS and b <= fl + EPS:
+                    score = (min(fw - a, fl - b), fy, fx)   # best short side, then nose-first
+                    if best is None or score < best[0]:
+                        best = (score, fx, fy, a, b)
+        if best is None:
+            return None
+        _s, x, y, a, b = best
+        placements.append((k, x, y, a, b))
+        nf = []
+        for (fx, fy, fw, fl) in free:
+            if x >= fx + fw - EPS or x + a <= fx + EPS or \
+               y >= fy + fl - EPS or y + b <= fy + EPS:
+                nf.append((fx, fy, fw, fl))
+                continue
+            if x > fx + EPS:                nf.append((fx, fy, x - fx, fl))
+            if x + a < fx + fw - EPS:       nf.append((x + a, fy, fx + fw - (x + a), fl))
+            if y > fy + EPS:                nf.append((fx, fy, fw, y - fy))
+            if y + b < fy + fl - EPS:       nf.append((fx, y + b, fw, fy + fl - (y + b)))
+        free = prune([f for f in nf if f[2] > EPS and f[3] > EPS])
+    return placements
+
+
+def find_layout(stacks, CW, CL, EPS=1.0):
+    """
+    THE shared layout finder used by BOTH the packer (to verify a container's
+    contents can actually be arranged) and the report (to draw them).
+
+    Tries every layout strategy — lane (wide/narrow), shelf/row, and true
+    MaxRects with several sort orders — and returns the first arrangement that
+    places EVERY stack strictly inside the container walls, or None if no
+    strategy can. Because the packer and the report call the same function,
+    the report can always draw exactly what the packer says fits: no rack is
+    ever drawn outside the container.
+
+    stacks  : list of (L, W, weight, key) tuples.
+    returns : [(key, x, y, iW, iL), ...] or None.
+    """
+    if not stacks:
+        return []
+
+    def ok(pl, lo=()):
+        return (pl and not lo
+                and max(x + a for (k, x, y, a, b) in pl) <= CW + EPS
+                and max(y + b for (k, x, y, a, b) in pl) <= CL + EPS)
+
+    for mode in ("maxdim", "area", "mindim"):
+        for bias in ("wide", "narrow"):
+            pl, lo = lane_layout(stacks, CW, CL, float("inf"), mode, bias)
+            if ok(pl, lo):
+                return pl
+    for mode in ("maxdim", "area", "mindim"):
+        pl, lo = shelf_layout(stacks, CW, CL, float("inf"), mode)
+        if ok(pl, lo):
+            return pl
+    for key in (lambda s: s[0] * s[1],
+                lambda s: max(s[0], s[1]),
+                lambda s: s[0],
+                lambda s: s[1],
+                lambda s: min(s[0], s[1])):
+        pl = maxrects_layout_all(stacks, CW, CL, key)
+        if pl and len(pl) == len(stacks) and ok(pl):
+            return pl
+    return None
+
+
 class MaxRectsBin:
     """
     2-D floor bin-packer using guillotine splits + Best-Short-Side-Fits.

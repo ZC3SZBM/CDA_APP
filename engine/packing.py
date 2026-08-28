@@ -701,6 +701,217 @@ def _lane_mixed_pack(stack_initial: dict, stack_dims: dict,
     return best
 
 
+def _shelf_pack(stack_initial: dict, stack_dims: dict,
+                CL: float, CW: float, MWT: float):
+    """
+    Shelf/row packing: fills each container with rows across the width (each
+    footprint turned to its column-efficient orientation), starting a new row
+    further along the length as rows fill. Catches "sectioned" fits the lane
+    packer misses. Tries a few sort orders and keeps the fewest-container plan.
+    """
+    from engine.geometry import shelf_layout
+    items = []
+    for sid, cnt in stack_initial.items():
+        L  = float(stack_dims[sid]["Length (MM)"])
+        W  = float(stack_dims[sid]["Width (MM)"])
+        wt = float(stack_dims[sid]["Weight (Kg)"])
+        for _ in range(int(cnt)):
+            items.append((L, W, wt, sid))
+    if not items or len(items) > 1200:
+        return None
+    best = None
+    for mode in ("maxdim", "area", "mindim"):
+        remaining = list(items)
+        containers, guard, ok = [], 0, True
+        while remaining:
+            guard += 1
+            if guard > len(items) + 5:
+                ok = False
+                break
+            placements, leftover = shelf_layout(remaining, CW, CL, MWT, mode)
+            if not placements:
+                ok = False
+                break
+            load = {}
+            for (k, x, y, a, b) in placements:
+                load[k] = load.get(k, 0) + 1
+            containers.append(load)
+            remaining = leftover
+        if ok and (best is None or len(containers) < len(best)):
+            best = containers
+    return best
+
+
+def max_units_in_one_container(rack_row, container):
+    """
+    CAPACITY ANALYSIS: how many of ONE package fit in a single container?
+
+    Rather than new packing maths (which could disagree with the planner), this
+    simply asks the real packer "does quantity N still fit in 1 container?" and
+    binary-searches the largest N that does. So the answer automatically obeys
+    every existing rule: stacking limits, metal nesting, the 540 kg bearing
+    capacity, the container weight limit, orientation choice, and the guarantee
+    that the layout is actually drawable inside the walls.
+
+    rack_row  : dict-like with "Length (MM)", "Width (MM)", "Height (MM)",
+                "Weight (Kg)", and optionally "Packaging Material"/"Stackability".
+    container : { "L", "W", "H", "MAX_WT" }
+
+    Returns
+    -------
+    (max_units, detail) : detail has per-stack height/footprint info, or
+                          (0, {"error": ...}) if a single unit cannot fit.
+    """
+    import pandas as _pd
+
+    name = str(rack_row.get("Rack / Finished Good", "PKG") or "PKG")
+    base = {
+        "Rack / Finished Good": name,
+        "Length (MM)": float(rack_row.get("Length (MM)", 0) or 0),
+        "Width (MM)":  float(rack_row.get("Width (MM)", 0) or 0),
+        "Height (MM)": float(rack_row.get("Height (MM)", 0) or 0),
+        "Weight (Kg)": float(rack_row.get("Weight (Kg)", 0) or 0),
+        "Packaging Material": rack_row.get("Packaging Material", ""),
+        "Stackability": rack_row.get("Stackability", "Auto"),
+    }
+
+    def fits(n):
+        """True if n units still pack into a single container."""
+        row = dict(base); row["Quantity"] = int(n)
+        try:
+            return len(pack_containers_exact(_pd.DataFrame([row]), container)) <= 1
+        except Exception:
+            return False
+
+    # A single unit must be shippable at all (validates size/weight).
+    probs = validate_inputs(_pd.DataFrame([dict(base, Quantity=1)]), container)
+    if probs:
+        return 0, {"error": probs[0]}
+    if not fits(1):
+        return 0, {"error": "A single unit does not fit in this container."}
+
+    # Upper bound from the physical limits (volume and weight), then exponential
+    # growth + binary search for the exact largest quantity that still fits.
+    CL, CW, CH = float(container["L"]), float(container["W"]), float(container["H"])
+    MWT = float(container["MAX_WT"])
+    vol_cap = (CL * CW * CH) / max(base["Length (MM)"] * base["Width (MM)"]
+                                   * base["Height (MM)"], 1.0)
+    wt_cap = (MWT / base["Weight (Kg)"]) if base["Weight (Kg)"] > 0 else vol_cap
+    hi_limit = max(1, int(min(vol_cap, wt_cap)) + 2)
+
+    lo = 1
+    hi = min(2, hi_limit)
+    while hi < hi_limit and fits(hi):          # grow until it no longer fits
+        lo = hi
+        hi = min(hi * 2, hi_limit)
+    if fits(hi):
+        best = hi
+    else:
+        while lo + 1 < hi:                      # binary search the boundary
+            mid = (lo + hi) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid
+        best = lo
+
+    # Describe the resulting single-container load for the user.
+    row = dict(base); row["Quantity"] = int(best)
+    df = _pd.DataFrame([row])
+    stacks = build_stacks({name: int(best)},
+                          {name: base}, CH, MWT)
+    per_stack = max((len(s) for s in stacks), default=1)
+    detail = {
+        "units": best,
+        "stacks": len(stacks),
+        "per_stack": per_stack,
+        "total_weight": best * base["Weight (Kg)"],
+        "weight_pct": (100.0 * best * base["Weight (Kg)"] / MWT) if MWT else 0.0,
+        "volume_pct": (100.0 * best * base["Length (MM)"] * base["Width (MM)"]
+                       * base["Height (MM)"]) / (CL * CW * CH),
+        # It is the WEIGHT limit that stops us only if one more unit would
+        # actually breach it; otherwise the floor/height space ran out first.
+        "limited_by": ("weight"
+                       if (base["Weight (Kg)"] > 0
+                           and (best + 1) * base["Weight (Kg)"] > MWT)
+                       else "space"),
+    }
+    return best, detail
+
+
+def _enforce_drawable(plan, stack_dims, CL, CW, MWT):
+    """
+    GUARANTEE that every container in the plan can actually be ARRANGED inside
+    the container walls — using the very same layout finder the report draws
+    with. A greedy packer can accept a set of footprints whose total area fits
+    while no real arrangement exists; that used to surface as racks drawn
+    outside the container in the PDF, which is meaningless on a loading dock.
+
+    Any stacks that cannot be arranged are lifted out and re-packed into extra
+    containers (each of which is validated the same way). The container count
+    may rise slightly, but every container in the result is genuinely loadable.
+    """
+    from engine.geometry import find_layout
+
+    def tuples(load):
+        out = []
+        for sid, cnt in load.items():
+            d = stack_dims[sid]
+            for i in range(int(cnt)):
+                out.append((float(d["Length (MM)"]), float(d["Width (MM)"]),
+                            float(d["Weight (Kg)"]), (sid, i)))
+        return out
+
+    fixed, spill = [], []
+    for load in plan:
+        load = {s: int(c) for s, c in load.items() if int(c) > 0}
+        if not load:
+            continue
+        items = tuples(load)
+        if find_layout(items, CW, CL) is not None:
+            fixed.append(load)
+            continue
+        # Drop the largest stacks until what remains can be arranged.
+        items.sort(key=lambda t: t[0] * t[1], reverse=True)
+        removed = []
+        while items and find_layout(items, CW, CL) is None:
+            removed.append(items.pop(0))
+        keep = {}
+        for (L, W, wt, key) in items:
+            sid = key[0]
+            keep[sid] = keep.get(sid, 0) + 1
+        if keep:
+            fixed.append(keep)
+        spill.extend(removed)
+
+    # Re-pack whatever spilled into additional validated containers.
+    guard = 0
+    while spill:
+        guard += 1
+        if guard > len(spill) + 5:
+            break
+        cur, rest, wt = [], [], 0.0
+        for it in sorted(spill, key=lambda t: t[0] * t[1], reverse=True):
+            if wt + it[2] > MWT + 1e-6:
+                rest.append(it)
+                continue
+            trial = cur + [it]
+            if find_layout(trial, CW, CL) is not None:
+                cur = trial
+                wt += it[2]
+            else:
+                rest.append(it)
+        if not cur:                     # a single stack that fits nothing: ship alone
+            cur = [spill[0]]
+            rest = spill[1:]
+        load = {}
+        for (L, W, w, key) in cur:
+            load[key[0]] = load.get(key[0], 0) + 1
+        fixed.append(load)
+        spill = rest
+    return fixed
+
+
 def _plan_fill_key(plan, stack_dims):
     """
     A comparable 'fill profile' for a plan: the floor area used in each
@@ -718,6 +929,58 @@ def _plan_fill_key(plan, stack_dims):
         fills.append(area)
     fills.sort(reverse=True)
     return tuple(fills)
+
+
+class PackingInputError(ValueError):
+    """Raised when input data cannot be shipped in the selected container."""
+
+
+def validate_inputs(df, container):
+    """
+    Check every rack CAN physically ship in the selected container BEFORE
+    packing. Without this, a rack that is too long / too wide / too tall / too
+    heavy is silently dropped: the app would report a container count that
+    quietly excludes those racks — dangerous when the count drives real
+    container orders. Returns a list of human-readable problems (empty if OK).
+    """
+    CL = float(container["L"]); CW = float(container["W"])
+    CH = float(container["H"]); MWT = float(container["MAX_WT"])
+    problems = []
+    for _i, r in df.iterrows():
+        name = str(r.get("Rack / Finished Good", "")).strip()
+        if not name:
+            continue
+        try:
+            L = float(r.get("Length (MM)", 0) or 0)
+            W = float(r.get("Width (MM)", 0) or 0)
+            H = float(r.get("Height (MM)", 0) or 0)
+            wt = float(r.get("Weight (Kg)", 0) or 0)
+            q = float(r.get("Quantity", 0) or 0)
+        except (TypeError, ValueError):
+            problems.append(f"{name}: dimensions/weight are not valid numbers.")
+            continue
+        if q < 0:
+            problems.append(f"{name}: quantity is negative.")
+        if min(L, W, H) <= 0:
+            problems.append(f"{name}: length/width/height must all be greater than 0.")
+            continue
+        if wt < 0:
+            problems.append(f"{name}: weight is negative.")
+        # footprint must fit the floor in at least one orientation
+        fits_flat = ((L <= CL and W <= CW) or (W <= CL and L <= CW))
+        if not fits_flat:
+            problems.append(
+                f"{name}: footprint {L:.0f} x {W:.0f} mm does not fit the container "
+                f"floor ({CL:.0f} x {CW:.0f} mm) in either orientation.")
+        if H > CH:
+            problems.append(
+                f"{name}: height {H:.0f} mm exceeds the container height "
+                f"({CH:.0f} mm).")
+        if wt > MWT:
+            problems.append(
+                f"{name}: one unit weighs {wt:,.0f} kg, more than the container "
+                f"limit ({MWT:,.0f} kg).")
+    return problems
 
 
 def pack_containers_exact(df, container):
@@ -743,7 +1006,20 @@ def pack_containers_exact(df, container):
     Returns
     -------
     list of dict  { rack_name: quantity_in_this_container }
+
+    Raises
+    ------
+    PackingInputError : if any rack cannot physically ship in this container
+                        (too long / wide / tall / heavy, or invalid numbers).
+                        Failing loudly is deliberate — silently dropping such a
+                        rack would understate the containers you need to order.
     """
+
+    problems = validate_inputs(df, container)
+    if problems:
+        raise PackingInputError(
+            "These racks cannot ship in the selected container:\n- "
+            + "\n- ".join(problems))
 
     # Group rows by rack NAME: sum duplicate rows, keep distinct racks separate.
     agg = {
@@ -825,7 +1101,7 @@ def pack_containers_exact(df, container):
             best_result = plan
 
     for method in (_single_footprint_pack, _lane_pack, _column_pack,
-                   _lane_mixed_pack):
+                   _lane_mixed_pack, _shelf_pack):
         try:
             cand = method(stack_initial, stack_dims, CL, CW, MWT)
         except Exception:
@@ -864,6 +1140,12 @@ def pack_containers_exact(df, container):
         if best_key is not None and best_key[0] == 1:
             break
 
+    # ── 3b) GUARANTEE the chosen plan is physically arrangeable: every
+    #        container must pass the same layout finder the report draws with,
+    #        so no rack can ever be drawn outside the container. ─────────────
+    if best_result:
+        best_result = _enforce_drawable(best_result, stack_dims, CL, CW, MWT)
+
     # ── 4) Map the stacks in each container back to real rack quantities.
     #       Pull `q` actual stacks from each group's pool (they are identical). ──
     containers = []
@@ -878,5 +1160,20 @@ def pack_containers_exact(df, container):
                 for b in stk:
                     names[b["name"]] = names.get(b["name"], 0) + 1
         containers.append(names)
+
+    # ── 5) SAFETY NET: every unit that went in must come out. A silent loss
+    #       here would understate the container count, so fail loudly instead. ─
+    want = {}
+    for nm, q in initial.items():
+        want[str(nm)] = want.get(str(nm), 0) + int(q)
+    got = {}
+    for c in containers:
+        for nm, q in c.items():
+            got[str(nm)] = got.get(str(nm), 0) + int(q)
+    missing = {k: want[k] - got.get(k, 0) for k in want if want[k] != got.get(k, 0)}
+    if missing:
+        raise PackingInputError(
+            "Internal packing error: these racks were not fully placed "
+            f"({missing}). Please report this input.")
 
     return containers
