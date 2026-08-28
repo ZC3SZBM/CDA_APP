@@ -11,7 +11,7 @@ from ui.sections import (
 )
 
 from config.containers import CONTAINERS
-from engine.packing import pack_containers_exact
+from engine.packing import pack_containers_exact, PackingInputError
 
 # ---------------------------------------------------------
 # Page config
@@ -122,7 +122,11 @@ if calculate_clicked:
     # NOT built here (it is slow for big jobs and often unwanted) — it is
     # generated on demand from the "Layout Report (PDF)" button in the results.
     with st.spinner("Calculating loading plan\u2026 please wait."):
-        containers = pack_containers_exact(data, container_spec)
+        try:
+            containers = pack_containers_exact(data, container_spec)
+        except PackingInputError as e:
+            st.error(str(e))
+            st.stop()
         dims = data.set_index("Rack / Finished Good").to_dict("index")
 
     # A fresh calculation invalidates any previously generated PDF.
