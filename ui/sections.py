@@ -519,6 +519,39 @@ def render_results(
     excel_bytes = _build_loading_plan_excel(export_rows)
 
     # ══════════════════════════════════════════════════════════════════════
+    # SINGLE-PACKAGE CAPACITY ANALYSIS
+    # When the user entered exactly ONE package, also answer the common
+    # question "how many of these fit in one container?". It reuses the real
+    # packer, so it respects stacking, nesting, weight and orientation rules.
+    # ══════════════════════════════════════════════════════════════════════
+    if len(data) == 1:
+        from engine.packing import max_units_in_one_container
+        row = data.iloc[0].to_dict()
+        try:
+            with st.spinner("Calculating how many fit in one container\u2026"):
+                max_units, detail = max_units_in_one_container(row, container_cfg)
+        except Exception:
+            max_units, detail = 0, {"error": "Could not compute capacity."}
+        with st.container(border=True):
+            st.markdown("#### \U0001F4E6 Container capacity for this package")
+            if max_units <= 0:
+                st.error(detail.get("error", "This package does not fit."))
+            else:
+                a, b, c = st.columns(3)
+                a.metric("Max units per container", max_units)
+                b.metric("Stacks on floor", detail["stacks"])
+                c.metric("Units per stack (max)", detail["per_stack"])
+                st.caption(
+                    f"One full container holds **{max_units}** units \u2014 "
+                    f"{detail['stacks']} floor positions stacked up to "
+                    f"{detail['per_stack']} high, "
+                    f"{detail['total_weight']:,.0f} kg "
+                    f"({detail['weight_pct']:.0f}% of the weight limit), "
+                    f"{detail['volume_pct']:.0f}% of the volume. "
+                    f"Limited by **{detail['limited_by']}**."
+                )
+
+    # ══════════════════════════════════════════════════════════════════════
     # SUMMARY BOX (top): containers required + downloads.
     # The Excel is built instantly; the PDF layout report is built ONLY when
     # the user asks for it (it is slow for many containers, and for large jobs
