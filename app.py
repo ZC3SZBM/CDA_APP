@@ -116,6 +116,19 @@ if calculate_clicked:
                      "Please fill it in for all rows.")
             st.stop()
 
+    # CAPACITY QUERY: if the user entered a SINGLE package and left Quantity
+    # blank/0, they want "how many fit in one container?" rather than a plan for
+    # a known quantity. Use 1 so the planner still runs, and the capacity box in
+    # the results answers their real question.
+    if len(data) == 1:
+        try:
+            _q = float(data.iloc[0].get("Quantity", 0) or 0)
+        except (TypeError, ValueError):
+            _q = 0
+        if _q <= 0:
+            data = data.copy()
+            data.iloc[0, data.columns.get_loc("Quantity")] = 1
+
     container_spec = CONTAINERS[container_type]
 
     # One-time heavy work: PACK the containers only. The PDF layout report is
