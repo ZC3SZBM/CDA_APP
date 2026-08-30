@@ -86,6 +86,19 @@ ALL_MATERIALS = PACKAGING_MATERIALS
 #   "G+1" .. "G+20" -> exactly Ground + N high (G+1 = 2 levels, G+2 = 3, ...).
 STACKABILITY_OPTIONS = ["Auto", "Non Stackable"] + [f"G+{i}" for i in range(1, 21)]
 
+# Loading access / allowed loading direction. The labels use the container's
+# own reference points (NOSE->DOORS = the long axis, SIDE->SIDE = the short
+# axis) because words like "along"/"across" can be read either way:
+#   4-Way : forklift can enter from any side -> the rack may be rotated (most
+#           packages).
+#   2-Way : the rack can only be picked from two sides, so its LENGTH must
+#           point one specific way.
+LOADING_ACCESS_OPTIONS = [
+    "4-Way (any direction)",
+    "Package length along container length",
+    "Package length along container width",
+]
+
 # Sensible defaults for a fresh row.
 # Packaging Material is left BLANK on purpose: it is MANDATORY, so the user must
 # actively choose it (a wrong/blank material would give the wrong bearing
@@ -93,6 +106,7 @@ STACKABILITY_OPTIONS = ["Auto", "Non Stackable"] + [f"G+{i}" for i in range(1, 2
 _PKG_DEFAULTS = {
     "Packaging Material": "",
     "Stackability": "Auto",
+    "Loading Access": LOADING_ACCESS_OPTIONS[0],   # 4-Way is the common case
 }
 PACKAGING_COLUMNS = list(_PKG_DEFAULTS.keys())
 
@@ -337,6 +351,9 @@ def render_upload_section():
         # Stackability is optional -> fill its default if the sheet lacks it.
         if "Stackability" not in df.columns:
             df["Stackability"] = _PKG_DEFAULTS["Stackability"]
+        # Loading Access is optional -> default to 4-Way if the sheet lacks it.
+        if "Loading Access" not in df.columns:
+            df["Loading Access"] = _PKG_DEFAULTS["Loading Access"]
         # Packaging Material is MANDATORY -> do NOT invent a default. If the
         # sheet has no material column, add it blank and warn the user.
         if "Packaging Material" not in df.columns:
@@ -366,8 +383,11 @@ def render_upload_section():
             "- **Folded height:** if a rack ships folded, enter its **folded** height.\n"
             "- **Packaging Material is required** for every rack (it sets the "
             "stacking / weight capacity).\n"
-            "- **Max units per container:** enter **one** package Details(L,W,H, Weight,Material), leave Quantity "
-            "blank, and click **Calculate Loading**."
+            "- **Loading Access:** 4-Way = can be rotated. 2-Way = loads one way "
+            "only \u2014 package length along the container **length** or **width**.\n"
+            "- **Max units per container:** enter one package Details "
+            "( L,W,H, Weight,Material), leave Quantity blank, and click "
+            "**Calculate Loading**."
         )
 
     # Source-of-truth dataframe fed to the editor. We keep it in session_state
@@ -384,6 +404,7 @@ def render_upload_section():
                 "Weight (Kg)": [""],
                 "Packaging Material": [_PKG_DEFAULTS["Packaging Material"]],
                 "Stackability": [_PKG_DEFAULTS["Stackability"]],
+                "Loading Access": [_PKG_DEFAULTS["Loading Access"]],
             }
         )
 
@@ -418,6 +439,13 @@ def render_upload_section():
                 help=("REQUIRED. Metal Rack / Plastic Box / Plastic Bin / "
                       "Plastic Pallet / Wooden Pallet+Corrugate Box / "
                       "Metal Pallet+Corrugate Box / Wooden Box / Plywood Box."),
+            ),
+            "Loading Access": st.column_config.SelectboxColumn(
+                "Loading Access", options=LOADING_ACCESS_OPTIONS,
+                help=("4-Way = forklift can enter from any side, so the rack "
+                      "may be rotated (most packages).  2-Way = the rack must "
+                      "be loaded one way only: its length runs along the "
+                      "container LENGTH, or along the container WIDTH."),
             ),
             "Stackability": st.column_config.SelectboxColumn(
                 "Stackability", options=STACKABILITY_OPTIONS,
@@ -538,23 +566,21 @@ def render_results(
         except Exception:
             max_units, detail = 0, {"error": "Could not compute capacity."}
         with st.container(border=True):
-            st.markdown("### \U0001F9EE Maximum units per container")
             if max_units <= 0:
-                st.error(detail.get("error", "This package does not fit."))
+                st.error("\U0001F4E6 " + detail.get("error",
+                                                    "This package does not fit."))
             else:
-                a, b, c = st.columns(3)
-                a.metric(f"Max {str(row.get('Rack / Finished Good','package'))} "
-                         f"per {container_type}", max_units)
-                b.metric("Floor positions", detail["stacks"])
-                c.metric("Units per stack", detail["per_stack"])
-                st.success(
-                    f"**{max_units} units** fit in one **{container_type}** \u2014 "
-                    f"{detail['stacks']} floor positions stacked up to "
-                    f"{detail['per_stack']} high. "
-                    f"Weight {detail['total_weight']:,.0f} kg "
-                    f"({detail['weight_pct']:.0f}% of limit), "
-                    f"volume {detail['volume_pct']:.0f}%. "
-                    f"Limited by **{detail['limited_by']}**."
+                st.markdown(
+                    f"\U0001F4E6 &nbsp;**Max {max_units} units** of "
+                    f"**{str(row.get('Rack / Finished Good','this package'))}** "
+                    f"per **{container_type}** &nbsp;\u00b7&nbsp; "
+                    f"{detail['stacks']} floor positions \u00d7 "
+                    f"{detail['per_stack']} high &nbsp;\u00b7&nbsp; "
+                    f"{detail['total_weight']:,.0f} kg "
+                    f"({detail['weight_pct']:.0f}%) &nbsp;\u00b7&nbsp; "
+                    f"volume {detail['volume_pct']:.0f}% &nbsp;\u00b7&nbsp; "
+                    f"limited by {detail['limited_by']}",
+                    unsafe_allow_html=True,
                 )
 
     # ══════════════════════════════════════════════════════════════════════
