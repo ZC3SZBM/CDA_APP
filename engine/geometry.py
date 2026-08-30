@@ -96,6 +96,21 @@ class Rect:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def _orients(st):
+    """
+    Allowed (across_width, along_length) orientations for a stack tuple.
+
+    Stack tuples are (L, W, weight, key) or (L, W, weight, key, rotatable).
+    A 2-way-access package is stored already turned the right way and marked
+    rotatable=False, so only its given orientation is offered — it can never be
+    rotated by any layout. 4-way packages (the default) offer both.
+    """
+    L, W = st[0], st[1]
+    rotatable = st[4] if len(st) > 4 else True
+    return ((W, L), (L, W)) if rotatable else ((W, L),)
+
+
 def lane_layout(stacks, CW, CL, MWT=float("inf"), sort_mode="maxdim",
                 lane_bias="wide", EPS=1.0):
     """
@@ -134,14 +149,14 @@ def lane_layout(stacks, CW, CL, MWT=float("inf"), sort_mode="maxdim",
     used_w, weight = 0.0, 0.0
 
     for st in order:
-        L, W, wt, k = st
+        L, W, wt, k = st[0], st[1], st[2], st[3]
         if weight + wt > MWT + EPS:
             leftover.append(st)
             continue
         done = False
         # 1) try to drop into an existing lane (widest cross that fits => least length)
         for lane in lanes:
-            opts = [(a, b) for (a, b) in ((W, L), (L, W))
+            opts = [(a, b) for (a, b) in _orients(st)
                     if a <= lane["w"] + EPS and lane["y"] + b <= CL + EPS]
             if opts:
                 a, b = max(opts, key=lambda o: o[0])
@@ -154,7 +169,7 @@ def lane_layout(stacks, CW, CL, MWT=float("inf"), sort_mode="maxdim",
             continue
         # 2) open a new lane across the remaining width, per the bias
         rem = CW - used_w
-        opts = [(a, b) for (a, b) in ((W, L), (L, W))
+        opts = [(a, b) for (a, b) in _orients(st)
                 if a <= rem + EPS and b <= CL + EPS]
         if not opts:
             leftover.append(st)
@@ -193,9 +208,9 @@ def shelf_layout(stacks, CW, CL, MWT=float("inf"), sort_mode="maxdim", EPS=1.0):
         keyf = lambda s: max(s[0], s[1])
     order = sorted(stacks, key=keyf, reverse=True)
 
-    def best_orient(L, W):
+    def best_orient(L, W, st=None):
         best = None
-        for across, along in ((W, L), (L, W)):
+        for across, along in (_orients(st) if st is not None else ((W, L), (L, W))):
             if across <= CW + EPS:
                 per = int((CW + EPS) // across)
                 if per >= 1:
@@ -211,7 +226,7 @@ def shelf_layout(stacks, CW, CL, MWT=float("inf"), sort_mode="maxdim", EPS=1.0):
     weight = 0.0
 
     for st in order:
-        L, W, wt, k = st
+        L, W, wt, k = st[0], st[1], st[2], st[3]
         if weight + wt > MWT + EPS:
             leftover.append(st)
             continue
@@ -220,7 +235,7 @@ def shelf_layout(stacks, CW, CL, MWT=float("inf"), sort_mode="maxdim", EPS=1.0):
         # is too deep for the remaining length gets dropped (and later drawn
         # outside the container) even though it would fit turned the other way.
         cands = []
-        for across, along in ((W, L), (L, W)):
+        for across, along in _orients(st):
             if across <= CW + EPS:
                 per = max(1, int((CW + EPS) // across))
                 cands.append((along / per, across, along))
@@ -289,10 +304,11 @@ def maxrects_layout_all(stacks, CW, CL, sort_key=None, EPS=1e-6):
     placements = []
     for st in sorted(stacks, key=sort_key, reverse=True):
         L, W = st[0], st[1]
-        k = st[-1]
+        k = st[3]
         best = None
+        _os = _orients(st)
         for (fx, fy, fw, fl) in free:
-            for (a, b) in ((W, L), (L, W)):
+            for (a, b) in _os:
                 if a <= fw + EPS and b <= fl + EPS:
                     score = (min(fw - a, fl - b), fy, fx)   # best short side, then nose-first
                     if best is None or score < best[0]:

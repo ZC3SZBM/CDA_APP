@@ -511,15 +511,18 @@ def _column_pack(stack_initial: dict, stack_dims: dict,
     for sid in stack_initial:
         rl = round(float(stack_dims[sid]["Length (MM)"]), 1)
         rw = round(float(stack_dims[sid]["Width (MM)"]),  1)
-        groups[(rl, rw)].extend([sid] * int(stack_initial[sid]))
+        rot = bool(stack_dims[sid].get("Rotatable", True))
+        groups[(rl, rw, rot)].extend([sid] * int(stack_initial[sid]))
     remaining = {f: list(s) for f, s in groups.items()}
 
     def cols(f):
-        rl, rw = f
+        rl, rw, rot = f
         out = []
         if 0 < rw <= CW:
             out.append((rw, int(CL // rl) if rl > 0 else 0))       # normal column
-        if 0 < rl <= CW and abs(rl - rw) > EPS:
+        # a 2-way package must not be turned, so only offer the rotated
+        # column when this footprint is allowed to rotate
+        if rot and 0 < rl <= CW and abs(rl - rw) > EPS:
             out.append((rl, int(CL // rw) if rw > 0 else 0))       # rotated column
         return [(cw, cap) for cw, cap in out if cap > 0]
 
@@ -672,7 +675,8 @@ def _lane_mixed_pack(stack_initial: dict, stack_dims: dict,
         W  = float(stack_dims[sid]["Width (MM)"])
         wt = float(stack_dims[sid]["Weight (Kg)"])
         for _ in range(int(cnt)):
-            items.append((L, W, wt, sid))
+            items.append((L, W, wt, sid,
+                          bool(stack_dims[sid].get("Rotatable", True))))
     if not items or len(items) > 1200:      # O(n^2) — skip for huge jobs
         return None
 
@@ -716,7 +720,8 @@ def _shelf_pack(stack_initial: dict, stack_dims: dict,
         W  = float(stack_dims[sid]["Width (MM)"])
         wt = float(stack_dims[sid]["Weight (Kg)"])
         for _ in range(int(cnt)):
-            items.append((L, W, wt, sid))
+            items.append((L, W, wt, sid,
+                          bool(stack_dims[sid].get("Rotatable", True))))
     if not items or len(items) > 1200:
         return None
     best = None
@@ -859,7 +864,8 @@ def _enforce_drawable(plan, stack_dims, CL, CW, MWT):
             d = stack_dims[sid]
             for i in range(int(cnt)):
                 out.append((float(d["Length (MM)"]), float(d["Width (MM)"]),
-                            float(d["Weight (Kg)"]), (sid, i)))
+                            float(d["Weight (Kg)"]), (sid, i),
+                            bool(d.get("Rotatable", True))))
         return out
 
     fixed, spill = [], []
@@ -877,8 +883,8 @@ def _enforce_drawable(plan, stack_dims, CL, CW, MWT):
         while items and find_layout(items, CW, CL) is None:
             removed.append(items.pop(0))
         keep = {}
-        for (L, W, wt, key) in items:
-            sid = key[0]
+        for it in items:
+            sid = it[3][0]
             keep[sid] = keep.get(sid, 0) + 1
         if keep:
             fixed.append(keep)
@@ -905,8 +911,8 @@ def _enforce_drawable(plan, stack_dims, CL, CW, MWT):
             cur = [spill[0]]
             rest = spill[1:]
         load = {}
-        for (L, W, w, key) in cur:
-            load[key[0]] = load.get(key[0], 0) + 1
+        for it in cur:
+            load[it[3][0]] = load.get(it[3][0], 0) + 1
         fixed.append(load)
         spill = rest
     return fixed
@@ -1030,7 +1036,8 @@ def pack_containers_exact(df, container):
         "Weight (Kg)": "first",
     }
     for opt in ("Packaging Material", "Material", "Packaging",
-                "Stackability", "Stack", "Max Stack"):
+                "Stackability", "Stack", "Max Stack",
+                "Loading Access", "Access", "Loading Direction", "Way"):
         if opt in df.columns:
             agg[opt] = "first"
 
@@ -1061,8 +1068,19 @@ def pack_containers_exact(df, container):
     from collections import defaultdict as _dd
     stack_groups = _dd(list)
     for stk in stacks:
-        key = (round(stk[0]["L"], 2), round(stk[0]["W"], 2),
-               round(sum(b["wt"] for b in stk), 2))
+        # LOADING ACCESS: a 2-way package can only be loaded one way round, so
+        # store its footprint ALREADY TURNED the right way and remember that it
+        # must not be rotated. "length" = package length runs along the
+        # container length (L stays along); "width" = the package length runs
+        # across the container width, so L/W are swapped here once. 4-way
+        # packages stay as entered and may be rotated freely by the layouts.
+        acc = stk[0].get("acc", "4way")
+        sL, sW = stk[0]["L"], stk[0]["W"]
+        if acc == "width":
+            sL, sW = sW, sL
+        rotatable = (acc == "4way")
+        key = (round(sL, 2), round(sW, 2),
+               round(sum(b["wt"] for b in stk), 2), rotatable)
         stack_groups[key].append(stk)
 
     stack_dims    = {}
@@ -1070,9 +1088,10 @@ def pack_containers_exact(df, container):
     stack_initial = {}
     for j, (key, stklist) in enumerate(stack_groups.items()):
         sid = f"__g{j}"
-        L, W, wt = key
+        L, W, wt, rotatable = key
         stack_dims[sid] = {"Length (MM)": L, "Width (MM)": W,
-                           "Height (MM)": CH, "Weight (Kg)": wt}
+                           "Height (MM)": CH, "Weight (Kg)": wt,
+                           "Rotatable": rotatable}
         stack_pool[sid]    = stklist
         stack_initial[sid] = len(stklist)
 

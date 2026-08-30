@@ -144,6 +144,52 @@ def can_place_on(upper_row, lower_row) -> bool:
     return True
 
 
+def access_of(row) -> str:
+    """
+    Forklift access / allowed loading direction for a package.
+
+      "4way"   : 4-way access — may be rotated; loads either way round.
+      "length" : the rack's LENGTH runs ALONG the container length
+                 (nose -> doors).
+      "width"  : the rack's LENGTH runs ACROSS the container width.
+
+    The dropdown labels state the geometry explicitly ("rack length ALONG
+    container length" / "ACROSS container width"), so this parser keys off the
+    words ALONG / ACROSS first — those are unambiguous. The older
+    "length wise / width wise" wording is still understood for backward
+    compatibility with sheets already saved.
+
+    Blank/unknown defaults to "4way" (the common case).
+    """
+    for k in ("Loading Access", "Access", "Loading Direction", "Way"):
+        if k in row and row[k] is not None:
+            s = str(row[k]).strip().lower().replace("-", " ").replace("_", " ")
+            if not s or s == "nan":
+                continue
+            if "4" in s or "four" in s or "any" in s:
+                return "4way"
+            # Clearest test: WHICH container dimension the package length
+            # follows — "…along container width" vs "…along container length".
+            if "container width" in s:
+                return "width"
+            if "container length" in s:
+                return "length"
+            # Other wordings that have been used
+            if "nose" in s or "door" in s:
+                return "length"
+            if "side" in s:
+                return "width"
+            if "across" in s:
+                return "width"
+            if "along" in s:
+                return "length"
+            if "length" in s:
+                return "length"
+            if "width" in s:
+                return "width"
+    return "4way"
+
+
 def _unit(name, row):
     return {
         "name": name,
@@ -154,6 +200,7 @@ def _unit(name, row):
         "mat": material_of(row),
         "stk": stackability_of(row),
         "cap": capacity_kg(row),
+        "acc": access_of(row),
     }
 
 

@@ -277,7 +277,12 @@ def _build_layout_and_counts(load: dict, dims: dict, container: dict,
     foots = {(round(s[0]["L"], 1), round(s[0]["W"], 1)) for s in stacks}
     placed = []
 
-    if len(foots) == 1 and stacks:
+    # A 2-way-access rack may not be rotated, so it must NOT use the
+    # mixed-orientation column layout below (that lane mix rotates half the
+    # racks). Those loads go to the access-aware layout finder instead.
+    all_rotatable = all(s[0].get("acc", "4way") == "4way" for s in stacks)
+
+    if len(foots) == 1 and stacks and all_rotatable:
         # ── Single footprint: optimal mixed-orientation column layout ────────
         # Fill the width with the best mix of a length-wise lane and a
         # width-wise lane (matches the packer, e.g. 1200x800 -> 10 + 15 = 25).
@@ -322,8 +327,20 @@ def _build_layout_and_counts(load: dict, dims: dict, container: dict,
         # ── Mixed footprints: prefer the LANE layout (matches the packer, and
         #    finds tight complementary-lane fits). If it can't place every stack
         #    within the walls, fall back to skyline, then to the MaxRects packer.
-        stack_tuples = [(s[0]["L"], s[0]["W"], sum(b["wt"] for b in s), i)
-                        for i, s in enumerate(stacks)]
+        # LOADING ACCESS: 2-way packages are stored already turned the correct
+        # way and are marked non-rotatable, so the drawing shows them loading
+        # only in their permitted direction (same rule the packer used).
+        def _oriented(s):
+            acc = s[0].get("acc", "4way")
+            L, W = s[0]["L"], s[0]["W"]
+            if acc == "width":
+                L, W = W, L
+            return L, W, (acc == "4way")
+
+        stack_tuples = []
+        for i, s in enumerate(stacks):
+            L, W, rot = _oriented(s)
+            stack_tuples.append((L, W, sum(b["wt"] for b in s), i, rot))
         from engine.geometry import find_layout
 
         # ONE shared layout finder, also used by the packer to validate each
