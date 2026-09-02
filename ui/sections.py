@@ -246,6 +246,28 @@ def _process_editor(edited):
     numeric_df = edited.copy()
     invalid = []
 
+    # A row the user has just started typing into is created fresh by the data
+    # editor, so its dropdown cells come back blank. Fill the OPTIONAL ones with
+    # their defaults (Stackability = Auto, Loading Access = 4-Way) so the table
+    # visibly shows what the engine will actually use. Packaging Material is
+    # deliberately NOT defaulted — it is mandatory and must be chosen.
+    for _col in ("Stackability", "Loading Access"):
+        if _col in display_df.columns:
+            def _is_blank(series):
+                # NOTE: .astype(str) leaves a real NaN as NaN (not "nan"), so
+                # fillna("") FIRST or empty rows are mistaken for filled ones.
+                s = series.fillna("").astype(str).str.strip().str.lower()
+                return s.isin(["", "nan", "none"])
+
+            _blank = _is_blank(display_df[_col])
+            if "Rack / Finished Good" in display_df.columns:
+                _named = ~_is_blank(display_df["Rack / Finished Good"])
+                _fill = _blank & _named
+            else:
+                _fill = _blank
+            display_df.loc[_fill, _col] = _PKG_DEFAULTS[_col]
+            numeric_df.loc[_fill, _col] = _PKG_DEFAULTS[_col]
+
     for col in _NUMERIC_TEXT_COLS:
         if col not in edited.columns:
             continue
@@ -279,9 +301,15 @@ def _process_editor(edited):
 
 
 def _display_changed(edited, display_df):
-    """True if a formula cell was rewritten (so we must re-render the editor)."""
-    for col in _NUMERIC_TEXT_COLS:
-        if col not in edited.columns:
+    """
+    True if the editor's contents need re-rendering — either a formula cell was
+    rewritten to its value, OR a blank optional dropdown was filled with its
+    default (Stackability = Auto, Loading Access = 4-Way). Both must trigger a
+    refresh, otherwise the filled-in defaults are used by the engine but never
+    become visible in the table.
+    """
+    for col in list(_NUMERIC_TEXT_COLS) + ["Stackability", "Loading Access"]:
+        if col not in edited.columns or col not in display_df.columns:
             continue
         a = edited[col].fillna("").astype(str).reset_index(drop=True)
         b = display_df[col].fillna("").astype(str).reset_index(drop=True)
