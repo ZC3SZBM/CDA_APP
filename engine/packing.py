@@ -956,6 +956,23 @@ def validate_inputs(df, container):
         name = str(r.get("Rack / Finished Good", "")).strip()
         if not name:
             continue
+
+        # Packaging Material is MANDATORY and enforced HERE (not only in the
+        # UI), because it decides the bearing capacity and the metal-on-
+        # corrugate rule. A blank material would silently fall back to generic
+        # assumptions and give wrong stacking — so every path into the engine
+        # (manual entry, Excel upload, or a future API) fails loudly instead.
+        mat = ""
+        for _k in ("Packaging Material", "Material", "Packaging", "Pkg Material"):
+            if _k in r and r.get(_k) is not None:
+                _v = str(r.get(_k)).strip()
+                if _v and _v.lower() not in ("nan", "none"):
+                    mat = _v
+                    break
+        if not mat:
+            problems.append(
+                f"{name}: Packaging Material is required (it sets the stacking "
+                f"and weight-bearing rules).")
         try:
             L = float(r.get("Length (MM)", 0) or 0)
             W = float(r.get("Width (MM)", 0) or 0)
