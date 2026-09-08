@@ -112,7 +112,7 @@ def _orients(st):
 
 
 def lane_layout(stacks, CW, CL, MWT=float("inf"), sort_mode="maxdim",
-                lane_bias="wide", EPS=1.0):
+                lane_bias="wide", balance=False, EPS=1.0):
     """
     Pack footprints into LANES that run along the container LENGTH.
 
@@ -154,8 +154,12 @@ def lane_layout(stacks, CW, CL, MWT=float("inf"), sort_mode="maxdim",
             leftover.append(st)
             continue
         done = False
-        # 1) try to drop into an existing lane (widest cross that fits => least length)
-        for lane in lanes:
+        # 1) drop into an existing lane. With balance=True we choose the
+        #    SHORTEST lane that fits, so the load spreads evenly across the
+        #    width (e.g. 6 + 6) instead of filling one lane and leaving a stub
+        #    (10 + 2), which would put the weight off-centre in the container.
+        lane_order = sorted(lanes, key=lambda ln: ln["y"]) if balance else lanes
+        for lane in lane_order:
             opts = [(a, b) for (a, b) in _orients(st)
                     if a <= lane["w"] + EPS and lane["y"] + b <= CL + EPS]
             if opts:
@@ -354,11 +358,15 @@ def find_layout(stacks, CW, CL, EPS=1.0):
                 and max(x + a for (k, x, y, a, b) in pl) <= CW + EPS
                 and max(y + b for (k, x, y, a, b) in pl) <= CL + EPS)
 
-    for mode in ("maxdim", "area", "mindim"):
-        for bias in ("wide", "narrow"):
-            pl, lo = lane_layout(stacks, CW, CL, float("inf"), mode, bias)
-            if ok(pl, lo):
-                return pl
+    # Balanced lane fills first (spread evenly across the width), then the
+    # tight fills as a fallback for loads that only fit when packed hard.
+    for bal in (True, False):
+        for mode in ("maxdim", "area", "mindim"):
+            for bias in ("wide", "narrow"):
+                pl, lo = lane_layout(stacks, CW, CL, float("inf"), mode, bias,
+                                     balance=bal)
+                if ok(pl, lo):
+                    return pl
     for mode in ("maxdim", "area", "mindim"):
         pl, lo = shelf_layout(stacks, CW, CL, float("inf"), mode)
         if ok(pl, lo):

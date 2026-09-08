@@ -305,9 +305,30 @@ def _build_layout_and_counts(load: dict, dims: dict, container: dict,
         for _ in range(nb):
             cols.append((x, rl, rw, capB)); x += rl
 
+        # LOAD DISTRIBUTION: when the container is NOT full, spread the stacks
+        # evenly across the columns instead of filling column 1 to capacity and
+        # leaving a stub in column 2. Twelve racks in two columns should load
+        # 6 + 6 (balanced side to side), not 10 + 2 — an off-centre load is bad
+        # practice on the road. A full container is unaffected: every column
+        # still fills to capacity.
+        total_cap = sum(c[3] for c in cols)
+        n = len(stacks)
+        if cols and n < total_cap:
+            share = [0] * len(cols)
+            i = 0
+            while sum(share) < n:                 # round-robin, respecting caps
+                if share[i % len(cols)] < cols[i % len(cols)][3]:
+                    share[i % len(cols)] += 1
+                i += 1
+                if i > n * len(cols) + len(cols):
+                    break
+        else:
+            share = [c[3] for c in cols]
+
         si = 0
-        for cx, ciW, ciL, cap in cols:
-            for k in range(cap):
+        for ci, (cx, ciW, ciL, cap) in enumerate(cols):
+            take = min(share[ci] if ci < len(share) else cap, cap)
+            for k in range(take):
                 if si >= len(stacks):
                     break
                 placed.append((stacks[si], cx, k * ciL, ciW, ciL))
