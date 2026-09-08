@@ -654,10 +654,43 @@ def render_results(
                     use_container_width=True,
                 )
         if total_cost is not None:
-            st.caption(f"Estimated transportation cost: **{cost_str}** "
-                       f"({origin_city} \u2192 {destination_city})")
+            # st.caption() renders small grey text that users miss, so the cost
+            # gets its own highlighted John Deere green strip instead.
+            st.markdown(
+                f"""
+                <div style="
+                    background-color:#EAF3E7;
+                    border-left:6px solid #367C2B;
+                    border-radius:6px;
+                    padding:9px 14px;
+                    margin-top:6px;
+                    font-size:1.02rem;
+                    color:#1E4620;">
+                  <span style="font-weight:600;">\U0001F69A Estimated transportation cost:</span>
+                  <span style="font-weight:800; color:#367C2B; font-size:1.18rem;">
+                    &nbsp;{cost_str}</span>
+                  <span style="color:#4A6B4A;">
+                    &nbsp;&nbsp;({origin_city} &rarr; {destination_city})</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
         else:
-            st.caption("Cost data not available for the selected route.")
+            st.markdown(
+                """
+                <div style="
+                    background-color:#FBF3E2;
+                    border-left:6px solid #C8A24A;
+                    border-radius:6px;
+                    padding:9px 14px;
+                    margin-top:6px;
+                    font-size:0.97rem;
+                    color:#6B5A22;">
+                  \u26A0\uFE0F Cost data not available for the selected route.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
     # ══════════════════════════════════════════════════════════════════════
     # DETAILS: container-wise loading plan + utilisation.
@@ -674,3 +707,4 @@ def render_results(
             f"**Weight Used:** {total_weight:.0f} KG ({weight_util:.2f}%)  \n"
             f"**Volume Utilization:** {volume_util:.2f}%"
         )
+
