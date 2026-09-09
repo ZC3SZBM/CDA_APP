@@ -1130,6 +1130,19 @@ def pack_containers_exact(df, container):
         plan = [c for c in plan if c]
         if not plan:
             return
+        # A plan is only worth what it is worth AFTER the drawable check: a
+        # container that cannot actually be arranged gets split, which pushes
+        # the count up. Validating BEFORE comparing stops us choosing a plan
+        # that looks best on paper but loses a container in the end.
+        if best_key is not None and len(plan) > best_key[0]:
+            return                                   # cannot win even if valid
+        try:
+            plan = _enforce_drawable(plan, stack_dims, CL, CW, MWT)
+            plan = [c for c in plan if c]
+        except Exception:
+            return
+        if not plan:
+            return
         fk  = _plan_fill_key(plan, stack_dims)          # fullest first
         key = (len(plan),) + tuple(-x for x in fk)      # fewer conts, then fuller c1...
         if best_key is None or key < best_key:
@@ -1179,8 +1192,7 @@ def pack_containers_exact(df, container):
     # ── 3b) GUARANTEE the chosen plan is physically arrangeable: every
     #        container must pass the same layout finder the report draws with,
     #        so no rack can ever be drawn outside the container. ─────────────
-    if best_result:
-        best_result = _enforce_drawable(best_result, stack_dims, CL, CW, MWT)
+    # (plans are already validated inside _consider, so no extra pass here)
 
     # ── 4) Map the stacks in each container back to real rack quantities.
     #       Pull `q` actual stacks from each group's pool (they are identical). ──
