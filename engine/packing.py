@@ -114,7 +114,9 @@ def _pack_one(remaining: dict, dims: dict,
         #   normal  : rack_W across container WIDTH,  rack_L into container LENGTH
         #   rotated : rack_L across container WIDTH,  rack_W into container LENGTH
         best = None  # (strip_W, strip_L, across, upr)
-        for iW, iL in ((rack_W, rack_L), (rack_L, rack_W)):
+        _rot = bool(dims[r].get("Rotatable", True))
+        for iW, iL in (((rack_W, rack_L), (rack_L, rack_W)) if _rot
+                       else ((rack_W, rack_L),)):
             across = int(CW // iW)
             if across == 0:
                 continue
@@ -180,12 +182,14 @@ def _pack_one(remaining: dict, dims: dict,
 
         while qty > 0:
             # bin_.can_place / place use (item_W, item_L); both rotations tried inside
-            if not bin_.can_place(rack_W, rack_L):
+            if not bin_.can_place(rack_W, rack_L,
+                                  allow_rotate=bool(dims[r].get("Rotatable", True))):
                 skipped.append(r); break
             add = _max_add(used_wt, stack, qty, r_wt, MWT)
             if add <= 0:
                 skipped.append(r); break
-            if not bin_.place(rack_W, rack_L):
+            if not bin_.place(rack_W, rack_L,
+                              allow_rotate=bool(dims[r].get("Rotatable", True))):
                 skipped.append(r); break
             load[r]  = load.get(r, 0) + add
             work[r]  = work.get(r, 0) - add
@@ -202,9 +206,11 @@ def _pack_one(remaining: dict, dims: dict,
             sL   = float(dims[sr]["Length (MM)"])
             swt  = float(dims[sr]["Weight (Kg)"])
             ss   = _stacks(dims[sr], CH)
-            if bin_.can_place(sW, sL):
+            if bin_.can_place(sW, sL,
+                              allow_rotate=bool(dims[sr].get("Rotatable", True))):
                 sadd = _max_add(used_wt, ss, sq, swt, MWT)
-                if sadd > 0 and bin_.place(sW, sL):
+                if sadd > 0 and bin_.place(sW, sL,
+                        allow_rotate=bool(dims[sr].get("Rotatable", True))):
                     load[sr]  = load.get(sr, 0) + sadd
                     work[sr]  = work.get(sr, 0) - sadd
                     used_wt  += sadd * swt
@@ -226,12 +232,14 @@ def _pack_one(remaining: dict, dims: dict,
         stack   = _stacks(dims[r], CH)
 
         while qty > 0:
-            if not bin_.can_place(rack_W, rack_L):
+            if not bin_.can_place(rack_W, rack_L,
+                                  allow_rotate=bool(dims[r].get("Rotatable", True))):
                 break
             add = _max_add(used_wt, stack, qty, r_wt, MWT)
             if add <= 0:
                 break
-            if not bin_.place(rack_W, rack_L):
+            if not bin_.place(rack_W, rack_L,
+                              allow_rotate=bool(dims[r].get("Rotatable", True))):
                 break
             load[r]  = load.get(r, 0) + add
             work[r]  = work.get(r, 0) - add
@@ -844,6 +852,340 @@ def max_units_in_one_container(rack_row, container):
     return best, detail
 
 
+def pack_into_n_containers(df, container, n_containers):
+    """
+    SHIP-WHAT-FITS mode: fill exactly `n_containers` as full as possible and
+    leave the rest behind for the next shipment.
+
+    The normal packer ships EVERYTHING and reports how many containers that
+    needs. Planners often want the opposite: "I have 8 trailers booked - load
+    them as full as you can and the leftovers wait for tomorrow." This function
+    answers that, maximising the NUMBER of deliveries shipped.
+
+    Returns (plan, shipped, left_behind) where
+      plan        : list of {rack: qty} - exactly n_containers or fewer
+      shipped     : {rack: qty} actually loaded
+      left_behind : {rack: qty} not loaded
+    """
+    import pandas as _pd
+    problems = validate_inputs(df, container)
+    if problems:
+        raise PackingInputError(
+            "These racks cannot ship in the selected container:\n- "
+            + "\n- ".join(problems))
+
+    n_containers = max(1, int(n_containers))
+    from engine.geometry import find_layout
+
+    CL, CW = float(container["L"]), float(container["W"])
+    CH, MWT = float(container["H"]), float(container["MAX_WT"])
+
+    # Build the stacks once (respects stacking / nesting / weight rules), then
+    # treat each finished stack as one floor item.
+    agg = {"Quantity": "sum"}
+    for c in df.columns:
+        if c not in ("Rack / Finished Good", "Quantity"):
+            agg[c] = "first"
+    g = df.groupby("Rack / Finished Good", as_index=False).agg(agg)
+    g["Rack / Finished Good"] = g["Rack / Finished Good"].astype(str)
+    initial = dict(zip(g["Rack / Finished Good"], g["Quantity"].astype(int)))
+    dims = g.set_index("Rack / Finished Good").to_dict("index")
+    stacks = build_stacks(initial, dims, CH, MWT)
+
+    from engine.stacking import access_of
+    items = []
+    for idx, stk in enumerate(stacks):
+        acc = stk[0].get("acc", "4way")
+        L, W = stk[0]["L"], stk[0]["W"]
+        if acc == "width":
+            L, W = W, L
+        items.append((L, W, sum(b["wt"] for b in stk), idx, acc == "4way",
+                      [b["name"] for b in stk]))
+
+    def _ok_cont(cont):
+        return find_layout([(a[0], a[1], a[2], a[3], a[4]) for a in cont],
+                           CW, CL) is not None
+
+    def _fill(order):
+        """Fill n containers, validating EVERY addition with the layout engine
+        so a container is only called full when nothing more can actually be
+        arranged inside its walls."""
+        pool = list(order)
+        plan, used = [], []
+        for _c in range(n_containers):
+            cur, rest, wt = [], [], 0.0
+            for it in pool:
+                if wt + it[2] > MWT + 1e-6:
+                    rest.append(it)
+                    continue
+                trial = [(a[0], a[1], a[2], a[3], a[4]) for a in cur + [it]]
+                if find_layout(trial, CW, CL) is not None:
+                    cur.append(it)
+                    wt += it[2]
+                else:
+                    rest.append(it)
+            if cur:
+                plan.append(cur)
+                used.extend(cur)
+            pool = rest
+            if not pool:
+                break
+        return plan, pool
+
+    # Several loading orders. We keep the one that leaves the LEAST SPACE
+    # behind, not the one that ships the most pieces: leaving nine short racks
+    # is far better than leaving nine 13.8 ft racks, because the leftovers have
+    # to fit the next (unbooked) container. Ties break toward fewer leftovers.
+    orders = [
+        sorted(items, key=lambda t: -t[0] * t[1]),      # biggest footprint first
+        sorted(items, key=lambda t: t[0] * t[1]),       # smallest first (most count)
+        sorted(items, key=lambda t: -t[0]),             # longest first
+        sorted(items, key=lambda t: t[0]),              # shortest first
+    ]
+    best = None
+    for o in orders:
+        plan, leftover = _fill(o)
+        left_space = sum(it[0] * it[1] for it in leftover)     # floor area left
+        key = (left_space, len(leftover))                      # smaller is better
+        if best is None or key < best[0]:
+            best = (key, plan, leftover)
+
+    # EXTRA CANDIDATE - uniform-width loads: fill each lane with the best
+    # possible combination of the remaining racks (bounded-knapsack), which
+    # packs far tighter than any fixed loading order. Only accepted if every
+    # container it produces can actually be arranged.
+    ws = {round(it[1], 2) for it in items}
+    if len(ws) == 1 and len(items) <= 400:
+        w0 = ws.pop()
+        k_l = int((CW + 1e-6) // w0)
+        if k_l >= 1:
+            step = 10.0
+            cap = int(CL // step)
+            pool = list(items)
+            conts_dp = [[] for _ in range(n_containers)]
+            for li in range(k_l * n_containers):
+                ci = li // k_l
+                if not pool:
+                    break
+                sizes = [int(-(-it[0] // step)) for it in pool]
+                bestv = [0] * (cap + 1)
+                pick = [None] * (cap + 1)
+                for i, sz in enumerate(sizes):
+                    for c in range(cap, sz - 1, -1):
+                        if bestv[c - sz] + sz > bestv[c]:
+                            bestv[c] = bestv[c - sz] + sz
+                            pick[c] = (i, c - sz)
+                c = max(range(cap + 1), key=lambda i: bestv[i])
+                chosen, seen = [], set()
+                while c > 0 and pick[c]:
+                    i, prev = pick[c]
+                    if i not in seen:
+                        seen.add(i)
+                        chosen.append(pool[i])
+                    c = prev
+                wt_c = sum(a[2] for a in conts_dp[ci])
+                for it in chosen:
+                    if wt_c + it[2] <= MWT + 1e-6:
+                        conts_dp[ci].append(it)
+                        wt_c += it[2]
+                        pool.remove(it)
+            if all(not c or _ok_cont(c) for c in conts_dp):
+                plan_dp = [c for c in conts_dp if c]
+                key = (sum(it[0] * it[1] for it in pool), len(pool))
+                if key < best[0]:
+                    best = (key, plan_dp, pool)
+
+    _k, plan_items, leftover = best
+
+    # ── IMPROVEMENT PASSES ────────────────────────────────────────────────
+    # Greedy filling can leave the WRONG things behind - e.g. nine 13.8 ft
+    # racks (124 ft, more than a whole trailer) instead of a mix that fits.
+    # Two cheap passes fix that:
+    #   1) TOP-UP  : try to squeeze each leftover into a container as-is.
+    #   2) SWAP    : trade a big leftover for a smaller shipped rack whenever
+    #                that reduces the space left behind and still fits.
+    def _ok(cont):
+        return find_layout([(a[0], a[1], a[2], a[3], a[4]) for a in cont],
+                           CW, CL) is not None
+
+    def _wt(cont):
+        return sum(a[2] for a in cont)
+
+    for _round in range(3):
+        moved = False
+        # 1) top-up
+        for it in sorted(leftover, key=lambda t: -t[0] * t[1]):
+            for cont in plan_items:
+                if _wt(cont) + it[2] > MWT + 1e-6:
+                    continue
+                if _ok(cont + [it]):
+                    cont.append(it)
+                    leftover.remove(it)
+                    moved = True
+                    break
+        # 2) swap a big leftover for a smaller shipped rack
+        for it in sorted(leftover, key=lambda t: -t[0] * t[1]):
+            done = False
+            for cont in plan_items:
+                for other in sorted(cont, key=lambda t: t[0] * t[1]):
+                    if other[0] * other[1] >= it[0] * it[1]:
+                        continue                       # must be SMALLER
+                    trial = [a for a in cont if a[3] != other[3]] + [it]
+                    if _wt(trial) > MWT + 1e-6:
+                        continue
+                    if _ok(trial):
+                        cont[:] = trial
+                        leftover.remove(it)
+                        leftover.append(other)
+                        moved = done = True
+                        break
+                if done:
+                    break
+        if not moved:
+            break
+
+    plan, shipped, left = [], {}, {}
+    for cont in plan_items:
+        load = {}
+        for it in cont:
+            for nm in it[5]:
+                load[nm] = load.get(nm, 0) + 1
+                shipped[nm] = shipped.get(nm, 0) + 1
+        if load:
+            plan.append(load)
+    for it in leftover:
+        for nm in it[5]:
+            left[nm] = left.get(nm, 0) + 1
+    return plan, shipped, left
+
+
+def _plan_is_drawable(plan, stack_pool, dims, CL, CW, CH, MWT):
+    """
+    Validate a plan the way the REPORT will see it.
+
+    The report is given rack QUANTITIES and rebuilds the stacks itself, so it
+    can group racks differently from the stacks the packer moved around. This
+    re-derives the stacks from rack counts exactly as the report does and
+    checks every container can still be arranged.
+    """
+    from engine.geometry import find_layout
+    pool = {sid: list(v) for sid, v in stack_pool.items()}
+    for load in plan:
+        names = {}
+        for sid, q in load.items():
+            lst = pool.get(sid, [])
+            for _ in range(int(q)):
+                if not lst:
+                    break
+                stk = lst.pop()
+                for b in stk:
+                    names[b["name"]] = names.get(b["name"], 0) + 1
+        if not names:
+            continue
+        stacks = build_stacks(names, dims, CH, MWT)
+        tup = []
+        for i, s in enumerate(stacks):
+            acc = s[0].get("acc", "4way")
+            L, W = s[0]["L"], s[0]["W"]
+            if acc == "width":
+                L, W = W, L
+            tup.append((L, W, sum(b["wt"] for b in s), i, acc == "4way"))
+        if sum(t[2] for t in tup) > MWT + 1e-6:
+            return False
+        if find_layout(tup, CW, CL) is None:
+            return False
+    return True
+
+
+def _redistribute(plan, stack_dims, CL, CW, CH, MWT, time_budget=20.0):
+    """
+    Try to DISSOLVE whole containers into the others.
+
+    The merge pass only combines two adjacent containers, so it misses the very
+    common case where one lightly-filled container's racks would each fit into
+    gaps spread across several other containers. Here we repeatedly take the
+    EMPTIEST container and try to rehome every one of its racks; if all of them
+    find a place, that container disappears.
+
+    Only a COMPLETE dissolution is accepted - moving some racks without
+    emptying the container saves nothing and only disturbs a working layout.
+    Every placement is validated with the shared layout finder, and the whole
+    pass is time-boxed so it cannot run away on a very large plan.
+
+    `plan` is rack-level ({rack: qty}) and `stack_dims` holds the rack rows, so
+    the racks are re-stacked exactly as the report will rebuild them.
+    """
+    import time as _t
+    from engine.geometry import find_layout
+    deadline = _t.time() + time_budget
+    FLOOR = CL * CW
+
+    def items_of(load):
+        """Re-stack a container's racks exactly as the report will, then treat
+        each finished stack as one floor rectangle."""
+        stacks = build_stacks(load, stack_dims, CH, MWT)
+        out = []
+        for i, s in enumerate(stacks):
+            acc = s[0].get("acc", "4way")
+            L, W = s[0]["L"], s[0]["W"]
+            if acc == "width":
+                L, W = W, L
+            out.append((L, W, sum(b["wt"] for b in s), tuple(b["name"] for b in s),
+                        acc == "4way"))
+        return out
+
+    conts = [items_of(c) for c in plan if c]
+    area = lambda c: sum(a[0] * a[1] for a in c)
+    wt   = lambda c: sum(a[2] for a in c)
+
+    progress = True
+    while progress and len(conts) > 1:
+        progress = False
+        # emptiest first - it is the most likely to be dissolvable
+        for idx in sorted(range(len(conts)), key=lambda i: area(conts[i])):
+            if _t.time() > deadline:
+                break
+            src_c = conts[idx]
+            others = [i for i in range(len(conts)) if i != idx]
+            # cheap feasibility screen before doing any real layout work
+            free = sum(FLOOR - area(conts[i]) for i in others)
+            if area(src_c) > free:
+                continue
+            trial = {i: list(conts[i]) for i in others}
+            ok = True
+            for it in sorted(src_c, key=lambda t: -t[0] * t[1]):
+                placed = False
+                for i in others:
+                    if wt(trial[i]) + it[2] > MWT + 1e-6:
+                        continue
+                    if area(trial[i]) + it[0] * it[1] > FLOOR + 1e-6:
+                        continue                      # cheap screen
+                    if find_layout(trial[i] + [it], CW, CL) is not None:
+                        trial[i].append(it)
+                        placed = True
+                        break
+                if not placed:
+                    ok = False
+                    break
+                if _t.time() > deadline:
+                    ok = False
+                    break
+            if ok:
+                conts = [trial[i] for i in others]
+                progress = True
+                break
+
+    out = []
+    for cont in conts:
+        load = {}
+        for it in cont:
+            for nm in it[3]:                      # every rack in that stack
+                load[nm] = load.get(nm, 0) + 1
+        if load:
+            out.append(load)
+    return out
+
+
 def _enforce_drawable(plan, stack_dims, CL, CW, MWT):
     """
     GUARANTEE that every container in the plan can actually be ARRANGED inside
@@ -891,10 +1233,13 @@ def _enforce_drawable(plan, stack_dims, CL, CW, MWT):
         spill.extend(removed)
 
     # Re-pack whatever spilled into additional validated containers.
-    guard = 0
+    # NOTE: the loop guard is computed ONCE from the initial spill size. Using
+    # len(spill) inside the loop was a bug - it shrinks each pass, so the guard
+    # could trip while racks were still unplaced and they were silently lost.
+    guard, guard_max = 0, len(spill) + 5
     while spill:
         guard += 1
-        if guard > len(spill) + 5:
+        if guard > guard_max:
             break
         cur, rest, wt = [], [], 0.0
         for it in sorted(spill, key=lambda t: t[0] * t[1], reverse=True):
@@ -915,6 +1260,11 @@ def _enforce_drawable(plan, stack_dims, CL, CW, MWT):
             load[it[3][0]] = load.get(it[3][0], 0) + 1
         fixed.append(load)
         spill = rest
+
+    # Anything still unplaced gets its own container rather than being dropped:
+    # the count may rise, but a rack must never vanish from the plan.
+    for it in spill:
+        fixed.append({it[3][0]: 1})
     return fixed
 
 
@@ -989,9 +1339,29 @@ def validate_inputs(df, container):
             continue
         if wt < 0:
             problems.append(f"{name}: weight is negative.")
-        # footprint must fit the floor in at least one orientation
-        fits_flat = ((L <= CL and W <= CW) or (W <= CL and L <= CW))
-        if not fits_flat:
+        # footprint must fit the floor. A 2-way rack may not be turned, so it
+        # must fit in THAT orientation - checking "either orientation" would let
+        # an impossible load through and the packer would silently rotate it.
+        acc = ""
+        for _k in ("Loading Access", "Access", "Loading Direction", "Way"):
+            if _k in r and r.get(_k) is not None:
+                _s = str(r.get(_k)).strip().lower()
+                if _s and _s not in ("nan", "none"):
+                    acc = _s
+                    break
+        if "container width" in acc:            # rack LENGTH runs across the width
+            if not (L <= CW and W <= CL):
+                problems.append(
+                    f"{name}: with 'package length along container width' it needs "
+                    f"{L:.0f} mm across the {CW:.0f} mm width and {W:.0f} mm along "
+                    f"the {CL:.0f} mm length - it does not fit that way.")
+        elif "container length" in acc:         # rack LENGTH runs along the length
+            if not (L <= CL and W <= CW):
+                problems.append(
+                    f"{name}: with 'package length along container length' it needs "
+                    f"{L:.0f} mm along the {CL:.0f} mm length and {W:.0f} mm across "
+                    f"the {CW:.0f} mm width - it does not fit that way.")
+        elif not ((L <= CL and W <= CW) or (W <= CL and L <= CW)):
             problems.append(
                 f"{name}: footprint {L:.0f} x {W:.0f} mm does not fit the container "
                 f"floor ({CL:.0f} x {CW:.0f} mm) in either orientation.")
@@ -1208,6 +1578,17 @@ def pack_containers_exact(df, container):
                 for b in stk:
                     names[b["name"]] = names.get(b["name"], 0) + 1
         containers.append(names)
+
+    # ── 4b) FINAL straggler pass: dissolve lightly-filled containers into the
+    #        others. Runs on the rack-level plan, validated exactly as the
+    #        report will rebuild it, so an accepted plan is always drawable.
+    if len(containers) > 1 and sum(sum(c.values()) for c in containers) <= 2000:
+        try:
+            improved = _redistribute(containers, dims, CL, CW, CH, MWT)
+            if improved and len(improved) < len(containers):
+                containers = improved
+        except Exception:
+            pass
 
     # ── 5) SAFETY NET: every unit that went in must come out. A silent loss
     #       here would understate the container count, so fail loudly instead. ─

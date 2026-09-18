@@ -344,6 +344,26 @@ def _build_layout_and_counts(load: dict, dims: dict, container: dict,
                 iW, iL = (rw, rl) if rw <= CW else (rl, rw)
                 xx, yy = _sky_place(sky, iW, iL, CW, CL)
                 placed.append((stacks[j], xx, yy, iW, iL))
+
+        # The column layout above is tuned for looks (balanced, nose-first) but
+        # is NOT guaranteed to fit a tightly-packed container. If it runs past
+        # the walls, fall back to the shared layout finder - the same one the
+        # packer validated this container with - so the drawing always matches
+        # a load that really fits.
+        if placed and (max(y + b for _s, x, y, a, b in placed) > CL + 1.0
+                       or max(x + a for _s, x, y, a, b in placed) > CW + 1.0):
+            from engine.geometry import find_layout as _fl
+            _tup = []
+            for _i, _s in enumerate(stacks):
+                _acc = _s[0].get("acc", "4way")
+                _L, _W = _s[0]["L"], _s[0]["W"]
+                if _acc == "width":
+                    _L, _W = _W, _L
+                _tup.append((_L, _W, sum(b["wt"] for b in _s), _i,
+                             _acc == "4way"))
+            _pl = _fl(_tup, CW, CL)
+            if _pl is not None:
+                placed = [(stacks[k], x, y, a, b) for (k, x, y, a, b) in _pl]
     else:
         # ── Mixed footprints: prefer the LANE layout (matches the packer, and
         #    finds tight complementary-lane fits). If it can't place every stack
@@ -656,7 +676,67 @@ def _draw_racks_3d(ax, records, azim=-55, elev=20):
         nz = rec["z"] + rec["h"]  if vdz > 0 else rec["z"]
         return nx * vdx + ny * vdy + nz * vdz
 
-    ordered = sorted(records, key=_near_depth)        # farthest -> nearest
+    def _painter_order(recs):
+        """
+        EXACT back-to-front order for axis-aligned boxes that do not overlap
+        in 3-D.
+
+        A depth score computed from a single point (centre or nearest corner)
+        is only an approximation: with racks of very different sizes, one box
+        can score "nearer" while a part of it is genuinely behind its
+        neighbour, which is what makes the ISO look like blocks are cutting
+        through each other.
+
+        Two disjoint boxes are always separated along at least one axis, and
+        along that axis the one on the far side from the camera must be drawn
+        first. That gives a strict ordering constraint per pair; a topological
+        sort of those constraints is a provably correct painter's order.
+        Falls back to the depth score if anything unexpected (a cycle) occurs.
+        """
+        n = len(recs)
+        if n > 400:                     # keep it cheap on very large loads
+            return sorted(recs, key=_near_depth)
+        EPSB = 1e-6
+        after = [[] for _ in range(n)]  # after[i] = boxes that must follow i
+        indeg = [0] * n
+        box = [(r["x"], r["x"] + r["iW"],
+                r["y"], r["y"] + r["iL"],
+                r["z"], r["z"] + r["h"]) for r in recs]
+        for i in range(n):
+            ax0, ax1, ay0, ay1, az0, az1 = box[i]
+            for j in range(i + 1, n):
+                bx0, bx1, by0, by1, bz0, bz1 = box[j]
+                first = second = None
+                if ax1 <= bx0 + EPSB:                 # i on -x side of j
+                    first, second = (i, j) if vdx > 0 else (j, i)
+                elif bx1 <= ax0 + EPSB:
+                    first, second = (j, i) if vdx > 0 else (i, j)
+                elif ay1 <= by0 + EPSB:               # i on -y side of j
+                    first, second = (i, j) if vdy > 0 else (j, i)
+                elif by1 <= ay0 + EPSB:
+                    first, second = (j, i) if vdy > 0 else (i, j)
+                elif az1 <= bz0 + EPSB:               # i below j
+                    first, second = (i, j) if vdz > 0 else (j, i)
+                elif bz1 <= az0 + EPSB:
+                    first, second = (j, i) if vdz > 0 else (i, j)
+                if first is not None:
+                    after[first].append(second)
+                    indeg[second] += 1
+        order, stack = [], sorted([i for i in range(n) if indeg[i] == 0],
+                                  key=lambda i: _near_depth(recs[i]))
+        while stack:
+            i = stack.pop(0)
+            order.append(i)
+            for j in after[i]:
+                indeg[j] -= 1
+                if indeg[j] == 0:
+                    stack.append(j)
+            stack.sort(key=lambda i: _near_depth(recs[i]))
+        if len(order) != n:                            # cycle -> safe fallback
+            return sorted(recs, key=_near_depth)
+        return [recs[i] for i in order]
+
+    ordered = _painter_order(records)                 # farthest -> nearest
     BASE_Z = 10                                        # always above the shell (zorder 0)
     FEPS = 1e-6
 

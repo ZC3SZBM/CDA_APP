@@ -30,6 +30,8 @@
 from collections import defaultdict
 
 DEFAULT_CAPACITY_KG = 540.0     # bearing capacity for NON-metal packaging
+WOOD_CAPACITY_KG = 1000.0       # solid wooden / plywood boxes carry more than
+                                # plastic or corrugate: 1 tonne
 METAL_NEST_MM = 50.8            # 2.0 inches: a metal rack nests this deep into the metal rack below
 _EPS = 1e-6
 
@@ -88,12 +90,26 @@ def stack_height_mm(units) -> float:
     return max(total, 0.0)
 
 
+def is_wood_box(mat: str) -> bool:
+    """
+    A SOLID wooden or plywood box (wood, no corrugate).
+
+    Note the corrugate exclusion: "Wooden Pallet + Corrugate Box" is wood
+    underneath but corrugate on top, and it is the corrugate that gets crushed,
+    so it keeps the lower 540 kg default rather than the 1,000 kg wood value.
+    """
+    if is_corrugate_top(mat):
+        return False
+    return ("wood" in mat) or ("ply" in mat) or ("timber" in mat)
+
+
 def capacity_kg(row) -> float:
     """
     Bearing capacity of a box (weight it can carry on top).
       * if the user gave an explicit Stackability -> trust it (no weight cap).
       * pure metal top (metal, no corrugate)      -> not weight-limited.
-      * everything else (corrugate / wood / plastic / metal-pallet+corrugate)
+      * solid wooden / plywood box (no corrugate) -> 1,000 kg.
+      * everything else (corrugate / plastic / metal-pallet+corrugate)
         -> 540 kg default.
     """
     if stackability_of(row) is not None:
@@ -101,6 +117,8 @@ def capacity_kg(row) -> float:
     mat = material_of(row)
     if is_metal_base(mat) and not is_corrugate_top(mat):
         return float("inf")          # e.g. "Metal Rack": strong metal top
+    if is_wood_box(mat):
+        return WOOD_CAPACITY_KG      # e.g. "Wooden Box", "Plywood Box"
     return DEFAULT_CAPACITY_KG
 
 
@@ -137,9 +155,25 @@ def stackability_of(row):
 def can_place_on(upper_row, lower_row) -> bool:
     """
     May the `upper` box sit directly on the `lower` box?
-    Forbidden only when a metal base rests on a corrugate top.
+
+    Two material rules are enforced:
+
+      1. A metal BASE may not rest on a CORRUGATE TOP - the metal would
+         crush the corrugate.
+
+      2. A solid METAL RACK only ever stacks with another metal rack, in
+         EITHER direction. A metal rack is an open frame with no closed top
+         surface, so a plastic or wooden box has nothing to sit on; and a
+         metal rack placed on a plastic or wooden box would damage it.
+         Metal racks stack on each other because they are built to interlock
+         (and they nest by METAL_NEST_MM).
+
+    In short: if either box is a metal rack, both must be metal racks.
     """
-    if is_metal_base(material_of(upper_row)) and is_corrugate_top(material_of(lower_row)):
+    up, lo = material_of(upper_row), material_of(lower_row)
+    if is_metal_base(up) and is_corrugate_top(lo):
+        return False
+    if is_metal_rack(up) != is_metal_rack(lo):
         return False
     return True
 
@@ -214,6 +248,12 @@ def _can_add(stack, u, CH, MWT):
 
     # (4) material exception: no metal base on a corrugate top
     if is_metal_base(u["mat"]) and is_corrugate_top(top["mat"]):
+        return False
+
+    # (4b) a solid METAL RACK only stacks with another metal rack, in either
+    #      direction: it is an open frame (nothing can rest on it), and placed
+    #      on a plastic or wooden box it would damage it.
+    if is_metal_rack(top["mat"]) != is_metal_rack(u["mat"]):
         return False
 
     new = stack + [u]
