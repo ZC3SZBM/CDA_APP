@@ -11,7 +11,8 @@ from ui.sections import (
 )
 
 from config.containers import CONTAINERS
-from engine.packing import pack_containers_exact, PackingInputError
+from engine.packing import (pack_containers_exact, pack_into_n_containers,
+                            PackingInputError)
 
 # ---------------------------------------------------------
 # Page config
@@ -75,8 +76,20 @@ with col3:
 # BUTTONS
 # ---------------------------------------------------------
 
-btn_left, btn_spacer, btn_right = st.columns([1, 6, 1])
+# ── Optional: ship only what fits in a fixed number of containers ──────────
+# Planners often have a fixed number of trucks booked and want them filled as
+# full as possible, with the remainder waiting for the next shipment.
+_lim1, _lim2 = st.columns([1, 3])
+with _lim1:
+    limit_on = st.checkbox("Limit to a fixed number of containers")
+with _lim2:
+    max_containers = st.number_input(
+        "How many containers are booked?", min_value=1, value=8, step=1,
+        disabled=not limit_on,
+        help=("Fills exactly this many containers as full as possible and lists "
+              "the deliveries left behind for the next shipment."))
 
+btn_left, btn_spacer, btn_right = st.columns([1, 6, 1])
 with btn_left:
     calculate_clicked = st.button("Calculate Loading")
 
@@ -134,9 +147,14 @@ if calculate_clicked:
     # One-time heavy work: PACK the containers only. The PDF layout report is
     # NOT built here (it is slow for big jobs and often unwanted) — it is
     # generated on demand from the "Layout Report (PDF)" button in the results.
+    left_behind = {}
     with st.spinner("Calculating loading plan\u2026 please wait."):
         try:
-            containers = pack_containers_exact(data, container_spec)
+            if limit_on:
+                containers, _shipped, left_behind = pack_into_n_containers(
+                    data, container_spec, int(max_containers))
+            else:
+                containers = pack_containers_exact(data, container_spec)
         except PackingInputError as e:
             st.error(str(e))
             st.stop()
@@ -153,9 +171,14 @@ if calculate_clicked:
         "origin_city":      origin_city,
         "destination_city": destination_city,
         "dims":             dims,
+        "left_behind":      left_behind,
     }
-    st.success(f"Loading plan ready \u2014 {len(containers)} container(s). "
-               "Download the Excel below, or generate the PDF layout report.")
+    if left_behind:
+        st.success(f"Loading plan ready \u2014 {len(containers)} container(s) filled, "
+                   f"{sum(left_behind.values())} delivery(ies) left for the next shipment.")
+    else:
+        st.success(f"Loading plan ready \u2014 {len(containers)} container(s). "
+                   "Download the Excel below, or generate the PDF layout report.")
 
 # ---------------------------------------------------------
 # SHOW RESULTS + DOWNLOADS  (runs on every rerun if a result exists)
@@ -173,6 +196,7 @@ if result is not None:
         result["destination_city"],
         container_cost_df,
         dry_van_cost_df,
+        result.get("left_behind"),
     )
 
 # ---------------------------------------------------------
