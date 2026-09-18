@@ -546,6 +546,7 @@ def render_results(
     destination_city,
     container_cost_df,
     dry_van_cost_df,
+    left_behind=None,
 ):
     container_cfg = CONTAINERS[container_type]
     container_volume = container_cfg["L"] * container_cfg["W"] * container_cfg["H"]
@@ -691,6 +692,43 @@ def render_results(
                 """,
                 unsafe_allow_html=True,
             )
+
+    # Deliveries deliberately not loaded (fixed-container mode).
+    if left_behind:
+        with st.container(border=True):
+            st.markdown(
+                f"\u23F3 **{sum(left_behind.values())} delivery(ies) left for the "
+                f"next shipment** \u2014 the booked containers are full.")
+            st.dataframe(
+                pd.DataFrame(sorted(left_behind.items()),
+                             columns=["Rack / Finished Good", "Quantity"]),
+                use_container_width=True, hide_index=True)
+
+    # ── "What if I book one container fewer?" ────────────────────────────
+    # Users shouldn't have to guess a number for the limit box. When the plan
+    # ends on a part-full container, work out what shipping in one FEWER
+    # container would cost and show it, so the trade-off is on screen without
+    # anyone having to type anything.
+    if not left_behind and n_containers > 1:
+        last_fill = per_container[-1][2]           # volume utilisation, %
+        if last_fill < 85.0:
+            _l = None
+            try:
+                from engine.packing import pack_into_n_containers
+                with st.spinner("Checking what one container fewer would cost\u2026"):
+                    _p, _s, _l = pack_into_n_containers(
+                        data, container_cfg, n_containers - 1)
+            except Exception:
+                _l = None
+            if _l:
+                st.info(
+                    f"\U0001F4A1 **Container {n_containers} is only "
+                    f"{last_fill:.0f}% full.** Shipping in "
+                    f"**{n_containers - 1} container(s)** instead would leave "
+                    f"**{sum(_l.values())} delivery(ies)** for the next "
+                    f"shipment. Tick *Limit to a fixed number of containers* "
+                    f"and enter **{n_containers - 1}** to see that plan."
+                )
 
     # ══════════════════════════════════════════════════════════════════════
     # DETAILS: container-wise loading plan + utilisation.
