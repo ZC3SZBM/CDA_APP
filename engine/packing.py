@@ -1279,9 +1279,12 @@ def _plan_fill_key(plan, stack_dims):
     fills = []
     for cont in plan:
         area = 0.0
-        for sid in cont:
+        for sid, cnt in cont.items():
+            # multiply by the COUNT: without it, 24 stacks and 27 stacks of the
+            # same rack scored identically, so the tie-break could not tell a
+            # full first container from a part-full one.
             d = stack_dims[sid]
-            area += float(d["Length (MM)"]) * float(d["Width (MM)"])
+            area += int(cnt) * float(d["Length (MM)"]) * float(d["Width (MM)"])
         fills.append(area)
     fills.sort(reverse=True)
     return tuple(fills)
